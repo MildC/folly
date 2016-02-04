@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,18 @@
 
 // @author: Xin Liu <xliux@fb.com>
 
+#include <memory>
 #include <set>
 #include <vector>
-#include <boost/thread.hpp>
+#include <thread>
+#include <system_error>
 
 #include <glog/logging.h>
 #include <gflags/gflags.h>
-#include "folly/ConcurrentSkipList.h"
-#include "folly/Foreach.h"
-#include "gtest/gtest.h"
+#include <folly/ConcurrentSkipList.h>
+#include <folly/Foreach.h>
+#include <folly/String.h>
+#include <gtest/gtest.h>
 
 DEFINE_int32(num_threads, 12, "num concurrent threads to test");
 
@@ -101,8 +104,8 @@ TEST(ConcurrentSkipList, SequentialAccess) {
     LOG(INFO) << "nodetype size=" << sizeof(SkipListNodeType);
 
     auto skipList(SkipListType::create(kHeadHeight));
-    EXPECT_TRUE(skipList.first() == NULL);
-    EXPECT_TRUE(skipList.last() == NULL);
+    EXPECT_TRUE(skipList.first() == nullptr);
+    EXPECT_TRUE(skipList.last() == nullptr);
 
     skipList.add(3);
     EXPECT_TRUE(skipList.contains(3));
@@ -205,16 +208,72 @@ TEST(ConcurrentSkipList, SequentialAccess) {
 
 }
 
+static std::string makeRandomeString(int len) {
+  std::string s;
+  for (int j = 0; j < len; j++) {
+    s.push_back((rand() % 26) + 'A');
+  }
+  return s;
+}
+
+TEST(ConcurrentSkipList, TestStringType) {
+  typedef folly::ConcurrentSkipList<std::string> SkipListT;
+  std::shared_ptr<SkipListT> skip = SkipListT::createInstance();
+  SkipListT::Accessor accessor(skip);
+  {
+    for (int i = 0; i < 100000; i++) {
+      std::string s = makeRandomeString(7);
+      accessor.insert(s);
+    }
+  }
+  EXPECT_TRUE(std::is_sorted(accessor.begin(), accessor.end()));
+}
+
+struct UniquePtrComp {
+  bool operator ()(
+      const std::unique_ptr<int> &x, const std::unique_ptr<int> &y) const {
+    if (!x) return false;
+    if (!y) return true;
+    return *x < *y;
+  }
+};
+
+TEST(ConcurrentSkipList, TestMovableData) {
+  typedef folly::ConcurrentSkipList<std::unique_ptr<int>, UniquePtrComp>
+    SkipListT;
+  auto sl = SkipListT::createInstance() ;
+  SkipListT::Accessor accessor(sl);
+
+  static const int N = 10;
+  for (int i = 0; i < N; ++i) {
+    accessor.insert(std::unique_ptr<int>(new int(i)));
+  }
+
+  for (int i = 0; i < N; ++i) {
+    EXPECT_TRUE(accessor.find(std::unique_ptr<int>(new int(i))) !=
+        accessor.end());
+  }
+  EXPECT_TRUE(accessor.find(std::unique_ptr<int>(new int(N))) ==
+      accessor.end());
+}
+
 void testConcurrentAdd(int numThreads) {
   auto skipList(SkipListType::create(kHeadHeight));
 
-  vector<boost::thread> threads;
+  vector<std::thread> threads;
   vector<SetType> verifiers(numThreads);
-  for (int i = 0; i < numThreads; ++i) {
-    threads.push_back(boost::thread(
-          &randomAdding, 100, skipList, &verifiers[i], kMaxValue));
+  try {
+    for (int i = 0; i < numThreads; ++i) {
+      threads.push_back(std::thread(
+            &randomAdding, 100, skipList, &verifiers[i], kMaxValue));
+    }
+  } catch (const std::system_error& e) {
+    LOG(WARNING)
+      << "Caught " << exceptionStr(e)
+      << ": could only create " << threads.size() << " threads out of "
+      << numThreads;
   }
-  for (int i = 0; i < threads.size(); ++i) {
+  for (size_t i = 0; i < threads.size(); ++i) {
     threads[i].join();
   }
 
@@ -238,11 +297,18 @@ void testConcurrentRemoval(int numThreads, int maxValue) {
     skipList.add(i);
   }
 
-  vector<boost::thread> threads;
+  vector<std::thread> threads;
   vector<SetType > verifiers(numThreads);
-  for (int i = 0; i < numThreads; ++i) {
-    threads.push_back(boost::thread(
-          &randomRemoval, 100, skipList, &verifiers[i], maxValue));
+  try {
+    for (int i = 0; i < numThreads; ++i) {
+      threads.push_back(std::thread(
+            &randomRemoval, 100, skipList, &verifiers[i], maxValue));
+    }
+  } catch (const std::system_error& e) {
+    LOG(WARNING)
+      << "Caught " << exceptionStr(e)
+      << ": could only create " << threads.size() << " threads out of "
+      << numThreads;
   }
   FOR_EACH(t, threads) {
     (*t).join();
@@ -284,24 +350,24 @@ static void testConcurrentAccess(
     std::sort(skipValues[i].begin(), skipValues[i].end());
   }
 
-  vector<boost::thread> threads;
+  vector<std::thread> threads;
   for (int i = 0; i < FLAGS_num_threads; ++i) {
     switch (i % 8) {
       case 0:
       case 1:
-        threads.push_back(boost::thread(
+        threads.push_back(std::thread(
               randomAdding, numInsertions, skipList, &verifiers[i], maxValue));
         break;
       case 2:
-        threads.push_back(boost::thread(
+        threads.push_back(std::thread(
               randomRemoval, numDeletions, skipList, &verifiers[i], maxValue));
         break;
       case 3:
-        threads.push_back(boost::thread(
+        threads.push_back(std::thread(
               concurrentSkip, &skipValues[i], skipList));
         break;
       default:
-        threads.push_back(boost::thread(sumAllValues, skipList, &sums[i]));
+        threads.push_back(std::thread(sumAllValues, skipList, &sums[i]));
         break;
     }
   }
@@ -323,7 +389,7 @@ TEST(ConcurrentSkipList, ConcurrentAccess) {
 int main(int argc, char* argv[]) {
   testing::InitGoogleTest(&argc, argv);
   google::InitGoogleLogging(argv[0]);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   return RUN_ALL_TESTS();
 }

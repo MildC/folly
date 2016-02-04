@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,9 @@
  * limitations under the License.
  */
 
-#include "folly/String.h"
+#include <folly/String.h>
 
-#include <random>
-#include <boost/algorithm/string.hpp>
 #include <gtest/gtest.h>
-
-#include "folly/Benchmark.h"
 
 using namespace folly;
 using namespace std;
@@ -60,11 +56,70 @@ TEST(StringPrintf, Appending) {
   EXPECT_EQ(s, "abc 123");
 }
 
+void vprintfCheck(const char* expected, const char* fmt, ...) {
+  va_list apOrig;
+  va_start(apOrig, fmt);
+  SCOPE_EXIT {
+    va_end(apOrig);
+  };
+  va_list ap;
+  va_copy(ap, apOrig);
+  SCOPE_EXIT {
+    va_end(ap);
+  };
+
+  // Check both APIs for calling stringVPrintf()
+  EXPECT_EQ(expected, stringVPrintf(fmt, ap));
+  va_end(ap);
+  va_copy(ap, apOrig);
+
+  std::string out;
+  stringVPrintf(&out, fmt, ap);
+  va_end(ap);
+  va_copy(ap, apOrig);
+  EXPECT_EQ(expected, out);
+
+  // Check stringVAppendf() as well
+  std::string prefix = "foobar";
+  out = prefix;
+  EXPECT_EQ(prefix + expected, stringVAppendf(&out, fmt, ap));
+  va_end(ap);
+  va_copy(ap, apOrig);
+}
+
+void vprintfError(const char* fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  SCOPE_EXIT {
+    va_end(ap);
+  };
+
+  // OSX's sprintf family does not return a negative number on a bad format
+  // string, but Linux does. It's unclear to me which behavior is more
+  // correct.
+#ifdef HAVE_VSNPRINTF_ERRORS
+  EXPECT_THROW({stringVPrintf(fmt, ap);},
+               std::runtime_error);
+#endif
+}
+
+TEST(StringPrintf, VPrintf) {
+  vprintfCheck("foo", "%s", "foo");
+  vprintfCheck("long string requiring reallocation 1 2 3 0x12345678",
+               "%s %s %d %d %d %#x",
+               "long string", "requiring reallocation", 1, 2, 3, 0x12345678);
+  vprintfError("bogus%", "foo");
+}
+
 TEST(StringPrintf, VariousSizes) {
-  // Test a wide variety of output sizes
-  for (int i = 0; i < 100; ++i) {
+  // Test a wide variety of output sizes, making sure to cross the
+  // vsnprintf buffer boundary implementation detail.
+  for (int i = 0; i < 4096; ++i) {
     string expected(i + 1, 'a');
-    EXPECT_EQ("X" + expected + "X", stringPrintf("X%sX", expected.c_str()));
+    expected = "X" + expected + "X";
+    string result = stringPrintf("%s", expected.c_str());
+    EXPECT_EQ(expected.size(), result.size());
+    EXPECT_EQ(expected, result);
   }
 
   EXPECT_EQ("abc12345678910111213141516171819202122232425xyz",
@@ -95,16 +150,6 @@ TEST(StringPrintf, oldStringAppendf) {
   EXPECT_EQ(string("helloa/b/c/d"), s);
 }
 
-BENCHMARK(new_stringPrintfSmall, iters) {
-  for (int64_t i = 0; i < iters; ++i) {
-    int32_t x = int32_t(i);
-    int32_t y = int32_t(i + 1);
-    string s =
-      stringPrintf("msg msg msg msg msg msg msg msg:  %d, %d, %s",
-                   x, y, "hello");
-  }
-}
-
 TEST(Escape, cEscape) {
   EXPECT_EQ("hello world", cEscape<std::string>("hello world"));
   EXPECT_EQ("hello \\\\world\\\" goodbye",
@@ -131,55 +176,94 @@ TEST(Escape, cUnescape) {
                std::invalid_argument);
 }
 
+TEST(Escape, uriEscape) {
+  EXPECT_EQ("hello%2c%20%2fworld", uriEscape<std::string>("hello, /world"));
+  EXPECT_EQ("hello%2c%20/world", uriEscape<std::string>("hello, /world",
+                                                        UriEscapeMode::PATH));
+  EXPECT_EQ("hello%2c+%2fworld", uriEscape<std::string>("hello, /world",
+                                                        UriEscapeMode::QUERY));
+  EXPECT_EQ(
+    "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_.~",
+    uriEscape<std::string>(
+      "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_.~")
+  );
+}
+
+TEST(Escape, uriUnescape) {
+  EXPECT_EQ("hello, /world", uriUnescape<std::string>("hello, /world"));
+  EXPECT_EQ("hello, /world", uriUnescape<std::string>("hello%2c%20%2fworld"));
+  EXPECT_EQ("hello,+/world", uriUnescape<std::string>("hello%2c+%2fworld"));
+  EXPECT_EQ("hello, /world", uriUnescape<std::string>("hello%2c+%2fworld",
+                                                      UriEscapeMode::QUERY));
+  EXPECT_EQ("hello/", uriUnescape<std::string>("hello%2f"));
+  EXPECT_EQ("hello/", uriUnescape<std::string>("hello%2F"));
+  EXPECT_THROW({uriUnescape<std::string>("hello%");},
+               std::invalid_argument);
+  EXPECT_THROW({uriUnescape<std::string>("hello%2");},
+               std::invalid_argument);
+  EXPECT_THROW({uriUnescape<std::string>("hello%2g");},
+               std::invalid_argument);
+}
+
 namespace {
-fbstring bmString;
-fbstring bmEscapedString;
-fbstring escapedString;
-fbstring unescapedString;
-const size_t kBmStringLength = 64 << 10;
-const uint32_t kPrintablePercentage = 90;
+void expectPrintable(StringPiece s) {
+  for (char c : s) {
+    EXPECT_LE(32, c);
+    EXPECT_GE(127, c);
+  }
+}
+}  // namespace
 
-void initBenchmark() {
-  bmString.reserve(kBmStringLength);
+TEST(Escape, uriEscapeAllCombinations) {
+  char c[3];
+  c[2] = '\0';
+  StringPiece in(c, 2);
+  fbstring tmp;
+  fbstring out;
+  for (int i = 0; i < 256; ++i) {
+    c[0] = i;
+    for (int j = 0; j < 256; ++j) {
+      c[1] = j;
+      tmp.clear();
+      out.clear();
+      uriEscape(in, tmp);
+      expectPrintable(tmp);
+      uriUnescape(tmp, out);
+      EXPECT_EQ(in, out);
+    }
+  }
+}
 
-  std::mt19937 rnd;
-  std::uniform_int_distribution<uint32_t> printable(32, 126);
-  std::uniform_int_distribution<uint32_t> nonPrintable(0, 160);
-  std::uniform_int_distribution<uint32_t> percentage(0, 99);
+namespace {
+bool isHex(int v) {
+  return ((v >= '0' && v <= '9') ||
+          (v >= 'A' && v <= 'F') ||
+          (v >= 'a' && v <= 'f'));
+}
+}  // namespace
 
-  for (size_t i = 0; i < kBmStringLength; ++i) {
-    unsigned char c;
-    if (percentage(rnd) < kPrintablePercentage) {
-      c = printable(rnd);
-    } else {
-      c = nonPrintable(rnd);
-      // Generate characters in both non-printable ranges:
-      // 0..31 and 127..255
-      if (c >= 32) {
-        c += (126 - 32) + 1;
+TEST(Escape, uriUnescapePercentDecoding) {
+  char c[4] = {'%', '\0', '\0', '\0'};
+  StringPiece in(c, 3);
+  fbstring out;
+  unsigned int expected = 0;
+  for (int i = 0; i < 256; ++i) {
+    c[1] = i;
+    for (int j = 0; j < 256; ++j) {
+      c[2] = j;
+      if (isHex(i) && isHex(j)) {
+        out.clear();
+        uriUnescape(in, out);
+        EXPECT_EQ(1, out.size());
+        EXPECT_EQ(1, sscanf(c + 1, "%x", &expected));
+        unsigned char v = out[0];
+        EXPECT_EQ(expected, v);
+      } else {
+        EXPECT_THROW({uriUnescape(in, out);}, std::invalid_argument);
       }
     }
-    bmString.push_back(c);
-  }
-
-  bmEscapedString = cEscape<fbstring>(bmString);
-}
-
-BENCHMARK(BM_cEscape, iters) {
-  while (iters--) {
-    escapedString = cEscape<fbstring>(bmString);
-    doNotOptimizeAway(escapedString.size());
   }
 }
-
-BENCHMARK(BM_cUnescape, iters) {
-  while (iters--) {
-    unescapedString = cUnescape<fbstring>(bmEscapedString);
-    doNotOptimizeAway(unescapedString.size());
-  }
-}
-
-}  // namespace
 
 namespace {
 
@@ -188,85 +272,176 @@ double pow2(int exponent) {
 }
 
 }  // namespace
+struct PrettyTestCase{
+  std::string prettyString;
+  double realValue;
+  PrettyType prettyType;
+};
 
-TEST(PrettyPrint, Basic) {
-  // check time printing
-  EXPECT_EQ(string("8.53e+07 s "), prettyPrint(85.3e6, PRETTY_TIME));
-  EXPECT_EQ(string("85.3 s "), prettyPrint(85.3, PRETTY_TIME));
-  EXPECT_EQ(string("85.3 ms"), prettyPrint(85.3e-3, PRETTY_TIME));
-  EXPECT_EQ(string("85.3 us"), prettyPrint(85.3e-6, PRETTY_TIME));
-  EXPECT_EQ(string("85.3 ns"), prettyPrint(85.3e-9, PRETTY_TIME));
-  EXPECT_EQ(string("85.3 ps"), prettyPrint(85.3e-12, PRETTY_TIME));
-  EXPECT_EQ(string("8.53e-14 s "), prettyPrint(85.3e-15, PRETTY_TIME));
+PrettyTestCase prettyTestCases[] =
+{
+  {string("8.53e+07 s "), 85.3e6,  PRETTY_TIME},
+  {string("8.53e+07 s "), 85.3e6,  PRETTY_TIME},
+  {string("85.3 ms"), 85.3e-3,  PRETTY_TIME},
+  {string("85.3 us"), 85.3e-6,  PRETTY_TIME},
+  {string("85.3 ns"), 85.3e-9,  PRETTY_TIME},
+  {string("85.3 ps"), 85.3e-12,  PRETTY_TIME},
+  {string("8.53e-14 s "), 85.3e-15,  PRETTY_TIME},
 
-  EXPECT_EQ(string("0 s "), prettyPrint(0, PRETTY_TIME));
-  EXPECT_EQ(string("1 s "), prettyPrint(1.0, PRETTY_TIME));
-  EXPECT_EQ(string("1 ms"), prettyPrint(1.0e-3, PRETTY_TIME));
-  EXPECT_EQ(string("1 us"), prettyPrint(1.0e-6, PRETTY_TIME));
-  EXPECT_EQ(string("1 ns"), prettyPrint(1.0e-9, PRETTY_TIME));
-  EXPECT_EQ(string("1 ps"), prettyPrint(1.0e-12, PRETTY_TIME));
+  {string("0 s "), 0,  PRETTY_TIME},
+  {string("1 s "), 1.0,  PRETTY_TIME},
+  {string("1 ms"), 1.0e-3,  PRETTY_TIME},
+  {string("1 us"), 1.0e-6,  PRETTY_TIME},
+  {string("1 ns"), 1.0e-9,  PRETTY_TIME},
+  {string("1 ps"), 1.0e-12,  PRETTY_TIME},
 
   // check bytes printing
-  EXPECT_EQ(string("853 B "), prettyPrint(853., PRETTY_BYTES));
-  EXPECT_EQ(string("833 kB"), prettyPrint(853.e3, PRETTY_BYTES));
-  EXPECT_EQ(string("813.5 MB"), prettyPrint(853.e6, PRETTY_BYTES));
-  EXPECT_EQ(string("7.944 GB"), prettyPrint(8.53e9, PRETTY_BYTES));
-  EXPECT_EQ(string("794.4 GB"), prettyPrint(853.e9, PRETTY_BYTES));
-  EXPECT_EQ(string("775.8 TB"), prettyPrint(853.e12, PRETTY_BYTES));
+  {string("853 B "), 853.,  PRETTY_BYTES},
+  {string("833 kB"), 853.e3,  PRETTY_BYTES},
+  {string("813.5 MB"), 853.e6,  PRETTY_BYTES},
+  {string("7.944 GB"), 8.53e9,  PRETTY_BYTES},
+  {string("794.4 GB"), 853.e9,  PRETTY_BYTES},
+  {string("775.8 TB"), 853.e12,  PRETTY_BYTES},
 
-  EXPECT_EQ(string("0 B "), prettyPrint(0, PRETTY_BYTES));
-  EXPECT_EQ(string("1 B "), prettyPrint(pow2(0), PRETTY_BYTES));
-  EXPECT_EQ(string("1 kB"), prettyPrint(pow2(10), PRETTY_BYTES));
-  EXPECT_EQ(string("1 MB"), prettyPrint(pow2(20), PRETTY_BYTES));
-  EXPECT_EQ(string("1 GB"), prettyPrint(pow2(30), PRETTY_BYTES));
-  EXPECT_EQ(string("1 TB"), prettyPrint(pow2(40), PRETTY_BYTES));
+  {string("0 B "), 0,  PRETTY_BYTES},
+  {string("1 B "), pow2(0),  PRETTY_BYTES},
+  {string("1 kB"), pow2(10),  PRETTY_BYTES},
+  {string("1 MB"), pow2(20),  PRETTY_BYTES},
+  {string("1 GB"), pow2(30),  PRETTY_BYTES},
+  {string("1 TB"), pow2(40),  PRETTY_BYTES},
+
+  {string("853 B  "), 853.,  PRETTY_BYTES_IEC},
+  {string("833 KiB"), 853.e3,  PRETTY_BYTES_IEC},
+  {string("813.5 MiB"), 853.e6,  PRETTY_BYTES_IEC},
+  {string("7.944 GiB"), 8.53e9,  PRETTY_BYTES_IEC},
+  {string("794.4 GiB"), 853.e9,  PRETTY_BYTES_IEC},
+  {string("775.8 TiB"), 853.e12,  PRETTY_BYTES_IEC},
+
+  {string("0 B  "), 0,  PRETTY_BYTES_IEC},
+  {string("1 B  "), pow2(0),  PRETTY_BYTES_IEC},
+  {string("1 KiB"), pow2(10),  PRETTY_BYTES_IEC},
+  {string("1 MiB"), pow2(20),  PRETTY_BYTES_IEC},
+  {string("1 GiB"), pow2(30),  PRETTY_BYTES_IEC},
+  {string("1 TiB"), pow2(40),  PRETTY_BYTES_IEC},
 
   // check bytes metric printing
-  EXPECT_EQ(string("853 B "), prettyPrint(853., PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("853 kB"), prettyPrint(853.e3, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("853 MB"), prettyPrint(853.e6, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("8.53 GB"), prettyPrint(8.53e9, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("853 GB"), prettyPrint(853.e9, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("853 TB"), prettyPrint(853.e12, PRETTY_BYTES_METRIC));
+  {string("853 B "), 853.,  PRETTY_BYTES_METRIC},
+  {string("853 kB"), 853.e3,  PRETTY_BYTES_METRIC},
+  {string("853 MB"), 853.e6,  PRETTY_BYTES_METRIC},
+  {string("8.53 GB"), 8.53e9,  PRETTY_BYTES_METRIC},
+  {string("853 GB"), 853.e9,  PRETTY_BYTES_METRIC},
+  {string("853 TB"), 853.e12,  PRETTY_BYTES_METRIC},
 
-  EXPECT_EQ(string("0 B "), prettyPrint(0, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("1 B "), prettyPrint(1.0, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("1 kB"), prettyPrint(1.0e+3, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("1 MB"), prettyPrint(1.0e+6, PRETTY_BYTES_METRIC));
+  {string("0 B "), 0,  PRETTY_BYTES_METRIC},
+  {string("1 B "), 1.0,  PRETTY_BYTES_METRIC},
+  {string("1 kB"), 1.0e+3,  PRETTY_BYTES_METRIC},
+  {string("1 MB"), 1.0e+6,  PRETTY_BYTES_METRIC},
 
-  EXPECT_EQ(string("1 GB"), prettyPrint(1.0e+9, PRETTY_BYTES_METRIC));
-  EXPECT_EQ(string("1 TB"), prettyPrint(1.0e+12, PRETTY_BYTES_METRIC));
+  {string("1 GB"), 1.0e+9,  PRETTY_BYTES_METRIC},
+  {string("1 TB"), 1.0e+12,  PRETTY_BYTES_METRIC},
 
   // check metric-units (powers of 1000) printing
-  EXPECT_EQ(string("853  "), prettyPrint(853., PRETTY_UNITS_METRIC));
-  EXPECT_EQ(string("853 k"), prettyPrint(853.e3, PRETTY_UNITS_METRIC));
-  EXPECT_EQ(string("853 M"), prettyPrint(853.e6, PRETTY_UNITS_METRIC));
-  EXPECT_EQ(string("8.53 bil"), prettyPrint(8.53e9, PRETTY_UNITS_METRIC));
-  EXPECT_EQ(string("853 bil"), prettyPrint(853.e9, PRETTY_UNITS_METRIC));
-  EXPECT_EQ(string("853 tril"), prettyPrint(853.e12, PRETTY_UNITS_METRIC));
+  {string("853  "), 853.,  PRETTY_UNITS_METRIC},
+  {string("853 k"), 853.e3,  PRETTY_UNITS_METRIC},
+  {string("853 M"), 853.e6,  PRETTY_UNITS_METRIC},
+  {string("8.53 bil"), 8.53e9,  PRETTY_UNITS_METRIC},
+  {string("853 bil"), 853.e9,  PRETTY_UNITS_METRIC},
+  {string("853 tril"), 853.e12,  PRETTY_UNITS_METRIC},
 
   // check binary-units (powers of 1024) printing
-  EXPECT_EQ(string("0  "), prettyPrint(0, PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1  "), prettyPrint(pow2(0), PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1 k"), prettyPrint(pow2(10), PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1 M"), prettyPrint(pow2(20), PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1 G"), prettyPrint(pow2(30), PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1 T"), prettyPrint(pow2(40), PRETTY_UNITS_BINARY));
+  {string("0  "), 0,  PRETTY_UNITS_BINARY},
+  {string("1  "), pow2(0),  PRETTY_UNITS_BINARY},
+  {string("1 k"), pow2(10),  PRETTY_UNITS_BINARY},
+  {string("1 M"), pow2(20),  PRETTY_UNITS_BINARY},
+  {string("1 G"), pow2(30),  PRETTY_UNITS_BINARY},
+  {string("1 T"), pow2(40),  PRETTY_UNITS_BINARY},
 
-  EXPECT_EQ(string("1023  "),
-      prettyPrint(pow2(10) - 1, PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1024 k"),
-      prettyPrint(pow2(20) - 1, PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1024 M"),
-      prettyPrint(pow2(30) - 1, PRETTY_UNITS_BINARY));
-  EXPECT_EQ(string("1024 G"),
-      prettyPrint(pow2(40) - 1, PRETTY_UNITS_BINARY));
+  {string("1023  "), pow2(10) - 1,  PRETTY_UNITS_BINARY},
+  {string("1024 k"), pow2(20) - 1,  PRETTY_UNITS_BINARY},
+  {string("1024 M"), pow2(30) - 1,  PRETTY_UNITS_BINARY},
+  {string("1024 G"), pow2(40) - 1,  PRETTY_UNITS_BINARY},
+
+  {string("0   "), 0,  PRETTY_UNITS_BINARY_IEC},
+  {string("1   "), pow2(0),  PRETTY_UNITS_BINARY_IEC},
+  {string("1 Ki"), pow2(10),  PRETTY_UNITS_BINARY_IEC},
+  {string("1 Mi"), pow2(20),  PRETTY_UNITS_BINARY_IEC},
+  {string("1 Gi"), pow2(30),  PRETTY_UNITS_BINARY_IEC},
+  {string("1 Ti"), pow2(40),  PRETTY_UNITS_BINARY_IEC},
+
+  {string("1023   "), pow2(10) - 1,  PRETTY_UNITS_BINARY_IEC},
+  {string("1024 Ki"), pow2(20) - 1,  PRETTY_UNITS_BINARY_IEC},
+  {string("1024 Mi"), pow2(30) - 1,  PRETTY_UNITS_BINARY_IEC},
+  {string("1024 Gi"), pow2(40) - 1,  PRETTY_UNITS_BINARY_IEC},
+
+  //check border SI cases
+
+  {string("1 Y"), 1e24,  PRETTY_SI},
+  {string("10 Y"), 1e25,  PRETTY_SI},
+  {string("1 y"), 1e-24,  PRETTY_SI},
+  {string("10 y"), 1e-23,  PRETTY_SI},
 
   // check that negative values work
-  EXPECT_EQ(string("-85.3 s "), prettyPrint(-85.3, PRETTY_TIME));
-  EXPECT_EQ(string("-85.3 ms"), prettyPrint(-85.3e-3, PRETTY_TIME));
-  EXPECT_EQ(string("-85.3 us"), prettyPrint(-85.3e-6, PRETTY_TIME));
-  EXPECT_EQ(string("-85.3 ns"), prettyPrint(-85.3e-9, PRETTY_TIME));
+  {string("-85.3 s "), -85.3,  PRETTY_TIME},
+  {string("-85.3 ms"), -85.3e-3,  PRETTY_TIME},
+  {string("-85.3 us"), -85.3e-6,  PRETTY_TIME},
+  {string("-85.3 ns"), -85.3e-9,  PRETTY_TIME},
+  // end of test
+  {string("endoftest"), 0, PRETTY_NUM_TYPES}
+};
+
+TEST(PrettyPrint, Basic) {
+  for (int i = 0; prettyTestCases[i].prettyType != PRETTY_NUM_TYPES; ++i){
+    const PrettyTestCase& prettyTest = prettyTestCases[i];
+    EXPECT_EQ(prettyTest.prettyString,
+              prettyPrint(prettyTest.realValue, prettyTest.prettyType));
+  }
+}
+
+TEST(PrettyToDouble, Basic) {
+  // check manually created tests
+  for (int i = 0; prettyTestCases[i].prettyType != PRETTY_NUM_TYPES; ++i){
+    PrettyTestCase testCase = prettyTestCases[i];
+    PrettyType formatType = testCase.prettyType;
+    double x = testCase.realValue;
+    std::string testString = testCase.prettyString;
+    double recoveredX = 0;
+    try{
+      recoveredX = prettyToDouble(testString, formatType);
+    } catch (std::range_error &ex){
+      EXPECT_TRUE(false);
+    }
+    double relativeError = fabs(x) < 1e-5 ? (x-recoveredX) :
+                                            (x - recoveredX) / x;
+    EXPECT_NEAR(0, relativeError, 1e-3);
+  }
+
+  // checks for compatibility with prettyPrint over the whole parameter space
+  for (int i = 0 ; i < PRETTY_NUM_TYPES; ++i){
+    PrettyType formatType = static_cast<PrettyType>(i);
+    for (double x = 1e-18; x < 1e40; x *= 1.9){
+      bool addSpace = static_cast<PrettyType> (i) == PRETTY_SI;
+      for (int it = 0; it < 2; ++it, addSpace = true){
+        double recoveredX = 0;
+        try{
+          recoveredX = prettyToDouble(prettyPrint(x, formatType, addSpace),
+                                             formatType);
+        } catch (std::range_error &ex){
+          EXPECT_TRUE(false);
+        }
+        double relativeError = (x - recoveredX) / x;
+        EXPECT_NEAR(0, relativeError, 1e-3);
+      }
+    }
+  }
+
+  // check for incorrect values
+  EXPECT_THROW(prettyToDouble("10Mx", PRETTY_SI), std::range_error);
+  EXPECT_THROW(prettyToDouble("10 Mx", PRETTY_SI), std::range_error);
+  EXPECT_THROW(prettyToDouble("10 M x", PRETTY_SI), std::range_error);
+
+  StringPiece testString = "10Mx";
+  EXPECT_DOUBLE_EQ(prettyToDouble(&testString, PRETTY_UNITS_METRIC), 10e6);
+  EXPECT_EQ(testString, "x");
 }
 
 TEST(PrettyPrint, HexDump) {
@@ -304,16 +479,6 @@ TEST(System, errnoStr) {
   EXPECT_EQ(EACCES, errno);
 }
 
-namespace folly_test {
-struct ThisIsAVeryLongStructureName {
-};
-}  // namespace folly_test
-
-TEST(System, demangle) {
-  EXPECT_EQ("folly_test::ThisIsAVeryLongStructureName",
-            demangle(typeid(folly_test::ThisIsAVeryLongStructureName)));
-}
-
 namespace {
 
 template<template<class,class> class VectorType>
@@ -321,6 +486,13 @@ void splitTest() {
   VectorType<string,std::allocator<string> > parts;
 
   folly::split(',', "a,b,c", parts);
+  EXPECT_EQ(parts.size(), 3);
+  EXPECT_EQ(parts[0], "a");
+  EXPECT_EQ(parts[1], "b");
+  EXPECT_EQ(parts[2], "c");
+  parts.clear();
+
+  folly::split(',', StringPiece("a,b,c"), parts);
   EXPECT_EQ(parts.size(), 3);
   EXPECT_EQ(parts[0], "a");
   EXPECT_EQ(parts[1], "b");
@@ -385,6 +557,13 @@ void splitTest() {
   EXPECT_EQ(parts[2], "kdbk");
   parts.clear();
 
+  // test last part is shorter than the delimiter
+  folly::split("bc", "abcd", parts, true);
+  EXPECT_EQ(parts.size(), 2);
+  EXPECT_EQ(parts[0], "a");
+  EXPECT_EQ(parts[1], "d");
+  parts.clear();
+
   string orig = "ab2342asdfv~~!";
   folly::split("", orig, parts, true);
   EXPECT_EQ(parts.size(), 1);
@@ -405,16 +584,25 @@ void splitTest() {
   EXPECT_EQ(parts[0], "");
   parts.clear();
 
+  folly::split("a", StringPiece(), parts, true);
+  EXPECT_EQ(parts.size(), 0);
+  parts.clear();
+
+  folly::split("a", StringPiece(), parts);
+  EXPECT_EQ(parts.size(), 1);
+  EXPECT_EQ(parts[0], "");
+  parts.clear();
+
   folly::split("a", "abcdefg", parts, true);
   EXPECT_EQ(parts.size(), 1);
   EXPECT_EQ(parts[0], "bcdefg");
   parts.clear();
 
-  orig = "All, , your bases, are , , belong to us";
+  orig = "All, , your base, are , , belong to us";
   folly::split(", ", orig, parts, true);
   EXPECT_EQ(parts.size(), 4);
   EXPECT_EQ(parts[0], "All");
-  EXPECT_EQ(parts[1], "your bases");
+  EXPECT_EQ(parts[1], "your base");
   EXPECT_EQ(parts[2], "are ");
   EXPECT_EQ(parts[3], "belong to us");
   parts.clear();
@@ -422,7 +610,7 @@ void splitTest() {
   EXPECT_EQ(parts.size(), 6);
   EXPECT_EQ(parts[0], "All");
   EXPECT_EQ(parts[1], "");
-  EXPECT_EQ(parts[2], "your bases");
+  EXPECT_EQ(parts[2], "your base");
   EXPECT_EQ(parts[3], "are ");
   EXPECT_EQ(parts[4], "");
   EXPECT_EQ(parts[5], "belong to us");
@@ -535,11 +723,11 @@ void piecesTest() {
   EXPECT_EQ(pieces[0], "bcdefg");
   pieces.clear();
 
-  orig = "All, , your bases, are , , belong to us";
+  orig = "All, , your base, are , , belong to us";
   folly::split(", ", orig, pieces, true);
   EXPECT_EQ(pieces.size(), 4);
   EXPECT_EQ(pieces[0], "All");
-  EXPECT_EQ(pieces[1], "your bases");
+  EXPECT_EQ(pieces[1], "your base");
   EXPECT_EQ(pieces[2], "are ");
   EXPECT_EQ(pieces[3], "belong to us");
   pieces.clear();
@@ -547,7 +735,7 @@ void piecesTest() {
   EXPECT_EQ(pieces.size(), 6);
   EXPECT_EQ(pieces[0], "All");
   EXPECT_EQ(pieces[1], "");
-  EXPECT_EQ(pieces[2], "your bases");
+  EXPECT_EQ(pieces[2], "your base");
   EXPECT_EQ(pieces[3], "are ");
   EXPECT_EQ(pieces[4], "");
   EXPECT_EQ(pieces[5], "belong to us");
@@ -604,42 +792,364 @@ TEST(Split, pieces_fbvector) {
   piecesTest<folly::fbvector>();
 }
 
-//////////////////////////////////////////////////////////////////////
+TEST(Split, fixed) {
+  StringPiece a, b, c, d;
 
-BENCHMARK(splitOnSingleChar, iters) {
-  const std::string line = "one:two:three:four";
-  for (int i = 0; i < iters << 4; ++i) {
-    std::vector<StringPiece> pieces;
-    folly::split(':', line, pieces);
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c.d", a, b, c, d));
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b, c));
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a, b));
+  EXPECT_TRUE(folly::split<false>('.', "a", a));
+
+  EXPECT_TRUE(folly::split('.', "a.b.c.d", a, b, c, d));
+  EXPECT_TRUE(folly::split('.', "a.b.c", a, b, c));
+  EXPECT_TRUE(folly::split('.', "a.b", a, b));
+  EXPECT_TRUE(folly::split('.', "a", a));
+
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b, c));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_EQ("c", c);
+  EXPECT_FALSE(folly::split<false>('.', "a.b", a, b, c));
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b.c", b);
+
+  EXPECT_TRUE(folly::split('.', "a.b.c", a, b, c));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_EQ("c", c);
+  EXPECT_FALSE(folly::split('.', "a.b.c", a, b));
+  EXPECT_FALSE(folly::split('.', "a.b", a, b, c));
+
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_FALSE(folly::split<false>('.', "a", a, b));
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a));
+  EXPECT_EQ("a.b", a);
+
+  EXPECT_TRUE(folly::split('.', "a.b", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_FALSE(folly::split('.', "a", a, b));
+  EXPECT_FALSE(folly::split('.', "a.b", a));
+}
+
+TEST(Split, std_string_fixed) {
+  std::string a, b, c, d;
+
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c.d", a, b, c, d));
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b, c));
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a, b));
+  EXPECT_TRUE(folly::split<false>('.', "a", a));
+
+  EXPECT_TRUE(folly::split('.', "a.b.c.d", a, b, c, d));
+  EXPECT_TRUE(folly::split('.', "a.b.c", a, b, c));
+  EXPECT_TRUE(folly::split('.', "a.b", a, b));
+  EXPECT_TRUE(folly::split('.', "a", a));
+
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b, c));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_EQ("c", c);
+  EXPECT_FALSE(folly::split<false>('.', "a.b", a, b, c));
+  EXPECT_TRUE(folly::split<false>('.', "a.b.c", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b.c", b);
+
+  EXPECT_TRUE(folly::split('.', "a.b.c", a, b, c));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_EQ("c", c);
+  EXPECT_FALSE(folly::split('.', "a.b.c", a, b));
+  EXPECT_FALSE(folly::split('.', "a.b", a, b, c));
+
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_FALSE(folly::split<false>('.', "a", a, b));
+  EXPECT_TRUE(folly::split<false>('.', "a.b", a));
+  EXPECT_EQ("a.b", a);
+
+  EXPECT_TRUE(folly::split('.', "a.b", a, b));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ("b", b);
+  EXPECT_FALSE(folly::split('.', "a", a, b));
+  EXPECT_FALSE(folly::split('.', "a.b", a));
+}
+
+TEST(Split, fixed_convert) {
+  StringPiece a, d;
+  int b;
+  double c = 0;
+
+  EXPECT_TRUE(folly::split(':', "a:13:14.7:b", a, b, c, d));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ(13, b);
+  EXPECT_NEAR(14.7, c, 1e-10);
+  EXPECT_EQ("b", d);
+
+  EXPECT_TRUE(folly::split<false>(':', "b:14:15.3:c", a, b, c, d));
+  EXPECT_EQ("b", a);
+  EXPECT_EQ(14, b);
+  EXPECT_NEAR(15.3, c, 1e-10);
+  EXPECT_EQ("c", d);
+
+  EXPECT_FALSE(folly::split(':', "a:13:14.7:b", a, b, d));
+
+  EXPECT_TRUE(folly::split<false>(':', "a:13:14.7:b", a, b, d));
+  EXPECT_EQ("a", a);
+  EXPECT_EQ(13, b);
+  EXPECT_EQ("14.7:b", d);
+
+  EXPECT_THROW(folly::split<false>(':', "a:13:14.7:b", a, b, c),
+               std::range_error);
+}
+
+TEST(String, join) {
+  string output;
+
+  std::vector<int> empty = { };
+  join(":", empty, output);
+  EXPECT_TRUE(output.empty());
+
+  std::vector<std::string> input1 = { "1", "23", "456", "" };
+  join(':', input1, output);
+  EXPECT_EQ(output, "1:23:456:");
+  output = join(':', input1);
+  EXPECT_EQ(output, "1:23:456:");
+
+  auto input2 = { 1, 23, 456 };
+  join("-*-", input2, output);
+  EXPECT_EQ(output, "1-*-23-*-456");
+  output = join("-*-", input2);
+  EXPECT_EQ(output, "1-*-23-*-456");
+
+  auto input3 = { 'f', 'a', 'c', 'e', 'b', 'o', 'o', 'k' };
+  join("", input3, output);
+  EXPECT_EQ(output, "facebook");
+
+  join("_", { "", "f", "a", "c", "e", "b", "o", "o", "k", "" }, output);
+  EXPECT_EQ(output, "_f_a_c_e_b_o_o_k_");
+
+  output = join("", input3.begin(), input3.end());
+  EXPECT_EQ(output, "facebook");
+}
+
+TEST(String, hexlify) {
+  string input1 = "0123";
+  string output1;
+  EXPECT_TRUE(hexlify(input1, output1));
+  EXPECT_EQ(output1, "30313233");
+
+  fbstring input2 = "abcdefg";
+  input2[1] = 0;
+  input2[3] = 0xff;
+  input2[5] = 0xb6;
+  fbstring output2;
+  EXPECT_TRUE(hexlify(input2, output2));
+  EXPECT_EQ(output2, "610063ff65b667");
+}
+
+TEST(String, unhexlify) {
+  string input1 = "30313233";
+  string output1;
+  EXPECT_TRUE(unhexlify(input1, output1));
+  EXPECT_EQ(output1, "0123");
+
+  fbstring input2 = "610063ff65b667";
+  fbstring output2;
+  EXPECT_TRUE(unhexlify(input2, output2));
+  EXPECT_EQ(output2.size(), 7);
+  EXPECT_EQ(output2[0], 'a');
+  EXPECT_EQ(output2[1], 0);
+  EXPECT_EQ(output2[2], 'c');
+  EXPECT_EQ(output2[3] & 0xff, 0xff);
+  EXPECT_EQ(output2[4], 'e');
+  EXPECT_EQ(output2[5] & 0xff, 0xb6);
+  EXPECT_EQ(output2[6], 'g');
+
+  string input3 = "x";
+  string output3;
+  EXPECT_FALSE(unhexlify(input3, output3));
+
+  string input4 = "xy";
+  string output4;
+  EXPECT_FALSE(unhexlify(input4, output4));
+}
+
+TEST(String, backslashify) {
+  EXPECT_EQ("abc", string("abc"));
+  EXPECT_EQ("abc", backslashify(string("abc")));
+  EXPECT_EQ("abc\\r", backslashify(string("abc\r")));
+  EXPECT_EQ("abc\\x0d", backslashify(string("abc\r"), true));
+  EXPECT_EQ("\\0\\0", backslashify(string(2, '\0')));
+}
+
+TEST(String, humanify) {
+  // Simple cases; output is obvious.
+  EXPECT_EQ("abc", humanify(string("abc")));
+  EXPECT_EQ("abc\\\\r", humanify(string("abc\\r")));
+  EXPECT_EQ("0xff", humanify(string("\xff")));
+  EXPECT_EQ("abc\\xff", humanify(string("abc\xff")));
+  EXPECT_EQ("abc\\b", humanify(string("abc\b")));
+  EXPECT_EQ("0x00", humanify(string(1, '\0')));
+  EXPECT_EQ("0x0000", humanify(string(2, '\0')));
+
+
+  // Mostly printable, so backslash!  80, 60, and 40% printable, respectively
+  EXPECT_EQ("aaaa\\xff", humanify(string("aaaa\xff")));
+  EXPECT_EQ("aaa\\xff\\xff", humanify(string("aaa\xff\xff")));
+  EXPECT_EQ("aa\\xff\\xff\\xff", humanify(string("aa\xff\xff\xff")));
+
+  // 20% printable, and the printable portion isn't the prefix; hexify!
+  EXPECT_EQ("0xff61ffffff", humanify(string("\xff" "a\xff\xff\xff")));
+
+  // Same as previous, except swap first two chars; prefix is
+  // printable and within the threshold, so backslashify.
+  EXPECT_EQ("a\\xff\\xff\\xff\\xff", humanify(string("a\xff\xff\xff\xff")));
+
+  // Just too much unprintable; hex, despite prefix.
+  EXPECT_EQ("0x61ffffffffff", humanify(string("a\xff\xff\xff\xff\xff")));
+}
+
+namespace {
+
+/**
+ * Copy bytes from src to somewhere in the buffer referenced by dst. The
+ * actual starting position of the copy will be the first address in the
+ * destination buffer whose address mod 8 is equal to the src address mod 8.
+ * The caller is responsible for ensuring that the destination buffer has
+ * enough extra space to accommodate the shifted copy.
+ */
+char* copyWithSameAlignment(char* dst, const char* src, size_t length) {
+  const char* originalDst = dst;
+  size_t dstOffset = size_t(dst) & 0x7;
+  size_t srcOffset = size_t(src) & 0x7;
+  while (dstOffset != srcOffset) {
+    dst++;
+    dstOffset++;
+    dstOffset &= 0x7;
+  }
+  CHECK(dst <= originalDst + 7);
+  CHECK((size_t(dst) & 0x7) == (size_t(src) & 0x7));
+  memcpy(dst, src, length);
+  return dst;
+}
+
+void testToLowerAscii(Range<const char*> src) {
+  // Allocate extra space so we can make copies that start at the
+  // same alignment (byte, word, quadword, etc) as the source buffer.
+  char controlBuf[src.size() + 7];
+  char* control = copyWithSameAlignment(controlBuf, src.begin(), src.size());
+
+  char testBuf[src.size() + 7];
+  char* test = copyWithSameAlignment(testBuf, src.begin(), src.size());
+
+  for (size_t i = 0; i < src.size(); i++) {
+    control[i] = tolower(control[i]);
+  }
+  toLowerAscii(test, src.size());
+  for (size_t i = 0; i < src.size(); i++) {
+    EXPECT_EQ(control[i], test[i]);
   }
 }
 
-BENCHMARK(splitStr, iters) {
-  const std::string line = "one-*-two-*-three-*-four";
-  for (int i = 0; i < iters << 4; ++i) {
-    std::vector<StringPiece> pieces;
-    folly::split("-*-", line, pieces);
+} // anon namespace
+
+TEST(String, toLowerAsciiAligned) {
+  static const size_t kSize = 256;
+  char input[kSize];
+  for (size_t i = 0; i < kSize; i++) {
+    input[i] = (char)(i & 0xff);
   }
+  testToLowerAscii(Range<const char*>(input, kSize));
 }
 
-BENCHMARK(boost_splitOnSingleChar, iters) {
-  std::string line = "one:two:three:four";
-  for (int i = 0; i < iters << 4; ++i) {
-    std::vector<boost::iterator_range<std::string::iterator>> pieces;
-    boost::split(pieces, line, [] (char c) { return c == ':'; });
+TEST(String, toLowerAsciiUnaligned) {
+  static const size_t kSize = 256;
+  char input[kSize];
+  for (size_t i = 0; i < kSize; i++) {
+    input[i] = (char)(i & 0xff);
   }
-}
-
-int main(int argc, char *argv[]) {
-  testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  auto ret = RUN_ALL_TESTS();
-  if (!ret) {
-    initBenchmark();
-    if (FLAGS_benchmark) {
-      folly::runBenchmarks();
+  // Test input buffers of several lengths to exercise all the
+  // cases: buffer at the start/middle/end of an aligned block, plus
+  // buffers that span multiple aligned blocks.  The longest test input
+  // is 3 unaligned bytes + 4 32-bit aligned bytes + 8 64-bit aligned
+  // + 4 32-bit aligned + 3 unaligned = 22 bytes.
+  for (size_t length = 1; length < 23; length++) {
+    for (size_t offset = 0; offset + length <= kSize; offset++) {
+      testToLowerAscii(Range<const char*>(input + offset, length));
     }
   }
-  return ret;
 }
 
+TEST(String, whitespace) {
+  // trimWhitespace:
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("kavabanga"));
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("kavabanga \t \n  "));
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("   \t \r \n \n kavabanga"));
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("\t \r \n   kavabanga \t \n  "));
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("   \t \r \n \n kavabanga"));
+  EXPECT_EQ("kavabanga",
+        trimWhitespace("\t \r \n   kavabanga \t \n  "));
+  EXPECT_EQ(
+    ltrimWhitespace(rtrimWhitespace("kavabanga")),
+    rtrimWhitespace(ltrimWhitespace("kavabanga")));
+  EXPECT_EQ(
+    ltrimWhitespace(rtrimWhitespace("kavabanga  \r\t\n")),
+    rtrimWhitespace(ltrimWhitespace("kavabanga  \r\t\n")));
+  EXPECT_EQ("", trimWhitespace("\t \r \n   \t \n  "));
+  EXPECT_EQ("", trimWhitespace(""));
+  EXPECT_EQ("", trimWhitespace("\t"));
+  EXPECT_EQ("", trimWhitespace("\r"));
+  EXPECT_EQ("", trimWhitespace("\n"));
+  EXPECT_EQ("", trimWhitespace("\t "));
+  EXPECT_EQ("", trimWhitespace("\r  "));
+  EXPECT_EQ("", trimWhitespace("\n   "));
+  EXPECT_EQ("", trimWhitespace("    \t"));
+  EXPECT_EQ("", trimWhitespace("    \r"));
+  EXPECT_EQ("", trimWhitespace("    \n"));
+
+  // ltrimWhitespace:
+  EXPECT_EQ("kavabanga", ltrimWhitespace("\t kavabanga"));
+  EXPECT_EQ("kavabanga \r\n", ltrimWhitespace("\t kavabanga \r\n"));
+  EXPECT_EQ("", ltrimWhitespace("\r "));
+  EXPECT_EQ("", ltrimWhitespace("\n   "));
+  EXPECT_EQ("", ltrimWhitespace("\r   "));
+
+  // rtrimWhitespace:
+  EXPECT_EQ("\t kavabanga", rtrimWhitespace("\t kavabanga"));
+  EXPECT_EQ("\t kavabanga", rtrimWhitespace("\t kavabanga \r\n"));
+  EXPECT_EQ("", rtrimWhitespace("\r "));
+  EXPECT_EQ("", rtrimWhitespace("\n   "));
+  EXPECT_EQ("", rtrimWhitespace("\r   "));
+}
+
+const folly::StringPiece kTestUTF8 = "This is \U0001F602 stuff!";
+
+TEST(UTF8StringPiece, valid_utf8) {
+  folly::StringPiece sp = kTestUTF8;
+  UTF8StringPiece utf8 = sp;
+  // utf8.size() not available since it's not a random-access range
+  EXPECT_EQ(16, utf8.walk_size());
+}
+
+TEST(UTF8StringPiece, valid_suffix) {
+  UTF8StringPiece utf8 = kTestUTF8.subpiece(8);
+  EXPECT_EQ(8, utf8.walk_size());
+}
+
+TEST(UTF8StringPiece, empty_mid_codepoint) {
+  UTF8StringPiece utf8 = kTestUTF8.subpiece(9, 0); // okay since it's empty
+  EXPECT_EQ(0, utf8.walk_size());
+}
+
+TEST(UTF8StringPiece, invalid_mid_codepoint) {
+  EXPECT_THROW(UTF8StringPiece(kTestUTF8.subpiece(9, 1)), std::out_of_range);
+}

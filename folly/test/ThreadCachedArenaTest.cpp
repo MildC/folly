@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,10 @@
  * limitations under the License.
  */
 
-#include "folly/ThreadCachedArena.h"
-#include "folly/StlAllocator.h"
+#include <folly/ThreadCachedArena.h>
+#include <folly/Memory.h>
 
+#include <map>
 #include <mutex>
 #include <thread>
 #include <iterator>
@@ -27,8 +28,8 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "folly/Range.h"
-#include "folly/Benchmark.h"
+#include <folly/Range.h>
+#include <folly/Benchmark.h>
 
 using namespace folly;
 
@@ -93,7 +94,7 @@ void ArenaTester::merge(ArenaTester&& other) {
 }  // namespace
 
 TEST(ThreadCachedArena, BlockSize) {
-  struct Align { char c; } __attribute__((aligned));
+  struct Align { char c; } __attribute__((__aligned__));
   static const size_t alignment = alignof(Align);
   static const size_t requestedBlockSize = 64;
 
@@ -118,9 +119,13 @@ TEST(ThreadCachedArena, BlockSize) {
 TEST(ThreadCachedArena, SingleThreaded) {
   static const size_t requestedBlockSize = 64;
   ThreadCachedArena arena(requestedBlockSize);
+  EXPECT_EQ(arena.totalSize(), sizeof(ThreadCachedArena));
+
   ArenaTester tester(arena);
   tester.allocate(100, 100 << 10);
   tester.verify();
+
+  EXPECT_GT(arena.totalSize(), sizeof(ThreadCachedArena));
 }
 
 TEST(ThreadCachedArena, MultiThreaded) {
@@ -255,11 +260,10 @@ BENCHMARK_DRAW_LINE()
 
 int main(int argc, char *argv[]) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   auto ret = RUN_ALL_TESTS();
   if (!ret && FLAGS_benchmark) {
     folly::runBenchmarks();
   }
   return ret;
 }
-

@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,19 @@
  * limitations under the License.
  */
 
-#include "folly/ThreadCachedArena.h"
+#include <folly/ThreadCachedArena.h>
+
+#include <memory>
 
 namespace folly {
 
-ThreadCachedArena::ThreadCachedArena(size_t minBlockSize)
-  : minBlockSize_(minBlockSize) {
+ThreadCachedArena::ThreadCachedArena(size_t minBlockSize, size_t maxAlign)
+  : minBlockSize_(minBlockSize), maxAlign_(maxAlign) {
 }
 
 SysArena* ThreadCachedArena::allocateThreadLocalArena() {
-  SysArena* arena = new SysArena(minBlockSize_);
+  SysArena* arena =
+    new SysArena(minBlockSize_, SysArena::kNoSizeLimit, maxAlign_);
   auto disposer = [this] (SysArena* t, TLPDestructionMode mode) {
     std::unique_ptr<SysArena> tp(t);  // ensure it gets deleted
     if (mode == TLPDestructionMode::THIS_THREAD) {
@@ -35,9 +38,16 @@ SysArena* ThreadCachedArena::allocateThreadLocalArena() {
 }
 
 void ThreadCachedArena::zombify(SysArena&& arena) {
-  std::lock_guard<std::mutex> lock(zombiesMutex_);
-  zombies_.merge(std::move(arena));
+  zombies_->merge(std::move(arena));
+}
+
+size_t ThreadCachedArena::totalSize() const {
+  size_t result = sizeof(ThreadCachedArena);
+  for (const auto& arena : arena_.accessAllThreads()) {
+    result += arena.totalSize();
+  }
+  result += zombies_->totalSize() - sizeof(SysArena);
+  return result;
 }
 
 }  // namespace folly
-

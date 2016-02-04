@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,12 +24,13 @@
 #ifndef FOLLY_BASE_CONV_H_
 #define FOLLY_BASE_CONV_H_
 
-#include "folly/FBString.h"
-#include "folly/Likely.h"
-#include "folly/Preprocessor.h"
-#include "folly/Range.h"
+#include <folly/FBString.h>
+#include <folly/Likely.h>
+#include <folly/Preprocessor.h>
+#include <folly/Range.h>
 
 #include <boost/implicit_cast.hpp>
+#include <algorithm>
 #include <type_traits>
 #include <limits>
 #include <string>
@@ -37,18 +38,68 @@
 #include <stdexcept>
 #include <typeinfo>
 
-#include "double-conversion.h"   // V8 JavaScript implementation
+#include <limits.h>
 
-#define FOLLY_RANGE_CHECK(condition, message)                           \
-  ((condition) ? (void)0 : throw std::range_error(                      \
-    (__FILE__ "(" + std::to_string((long long int) __LINE__) + "): "    \
-     + (message)).c_str()))
+// V8 JavaScript implementation
+#include <double-conversion/double-conversion.h>
+
+#define FOLLY_RANGE_CHECK_STRINGIZE(x) #x
+#define FOLLY_RANGE_CHECK_STRINGIZE2(x) FOLLY_RANGE_CHECK_STRINGIZE(x)
+
+// Android doesn't support std::to_string so just use a placeholder there.
+#ifdef __ANDROID__
+#define FOLLY_RANGE_CHECK_TO_STRING(x) std::string("N/A")
+#else
+#define FOLLY_RANGE_CHECK_TO_STRING(x) std::to_string(x)
+#endif
+
+#define FOLLY_RANGE_CHECK(condition, message, src)                          \
+  ((condition) ? (void)0 : throw std::range_error(                          \
+    (std::string(__FILE__ "(" FOLLY_RANGE_CHECK_STRINGIZE2(__LINE__) "): ") \
+     + (message) + ": '" + (src) + "'").c_str()))
+
+#define FOLLY_RANGE_CHECK_BEGIN_END(condition, message, b, e)    \
+  FOLLY_RANGE_CHECK(condition, message, std::string((b), (e) - (b)))
+
+#define FOLLY_RANGE_CHECK_STRINGPIECE(condition, message, sp)    \
+  FOLLY_RANGE_CHECK(condition, message, std::string((sp).data(), (sp).size()))
 
 namespace folly {
+
+/**
+ * The identity conversion function.
+ * to<T>(T) returns itself for all types T.
+ */
+template <class Tgt, class Src>
+typename std::enable_if<std::is_same<Tgt, Src>::value, Tgt>::type
+to(const Src & value) {
+  return value;
+}
+
+template <class Tgt, class Src>
+typename std::enable_if<std::is_same<Tgt, Src>::value, Tgt>::type
+to(Src && value) {
+  return std::move(value);
+}
 
 /*******************************************************************************
  * Integral to integral
  ******************************************************************************/
+
+/**
+ * Unchecked conversion from integral to boolean. This is different from the
+ * other integral conversions because we use the C convention of treating any
+ * non-zero value as true, instead of range checking.
+ */
+template <class Tgt, class Src>
+typename std::enable_if<
+  std::is_integral<Src>::value
+  && !std::is_same<Tgt, Src>::value
+  && std::is_same<Tgt, bool>::value,
+  Tgt>::type
+to(const Src & value) {
+  return value != 0;
+}
 
 /**
  * Checked conversion from integral to integral. The checks are only
@@ -57,18 +108,25 @@ namespace folly {
  */
 template <class Tgt, class Src>
 typename std::enable_if<
-  std::is_integral<Src>::value && std::is_integral<Tgt>::value,
+  std::is_integral<Src>::value
+  && !std::is_same<Tgt, Src>::value
+  && !std::is_same<Tgt, bool>::value
+  && std::is_integral<Tgt>::value,
   Tgt>::type
 to(const Src & value) {
   /* static */ if (std::numeric_limits<Tgt>::max()
                    < std::numeric_limits<Src>::max()) {
-    FOLLY_RANGE_CHECK(value <= std::numeric_limits<Tgt>::max(),
-                      "Overflow");
+    FOLLY_RANGE_CHECK(
+      (!greater_than<Tgt, std::numeric_limits<Tgt>::max()>(value)),
+      "Overflow",
+      FOLLY_RANGE_CHECK_TO_STRING(value));
   }
   /* static */ if (std::is_signed<Src>::value &&
                    (!std::is_signed<Tgt>::value || sizeof(Src) > sizeof(Tgt))) {
-    FOLLY_RANGE_CHECK(value >= std::numeric_limits<Tgt>::min(),
-                      "Negative overflow");
+    FOLLY_RANGE_CHECK(
+      (!less_than<Tgt, std::numeric_limits<Tgt>::min()>(value)),
+      "Negative overflow",
+      FOLLY_RANGE_CHECK_TO_STRING(value));
   }
   return static_cast<Tgt>(value);
 }
@@ -79,15 +137,19 @@ to(const Src & value) {
 
 template <class Tgt, class Src>
 typename std::enable_if<
-  std::is_floating_point<Tgt>::value && std::is_floating_point<Src>::value,
+  std::is_floating_point<Tgt>::value
+  && std::is_floating_point<Src>::value
+  && !std::is_same<Tgt, Src>::value,
   Tgt>::type
 to(const Src & value) {
   /* static */ if (std::numeric_limits<Tgt>::max() <
                    std::numeric_limits<Src>::max()) {
     FOLLY_RANGE_CHECK(value <= std::numeric_limits<Tgt>::max(),
-                      "Overflow");
+                      "Overflow",
+                      FOLLY_RANGE_CHECK_TO_STRING(value));
     FOLLY_RANGE_CHECK(value >= -std::numeric_limits<Tgt>::max(),
-                      "Negative overflow");
+                      "Negative overflow",
+                      FOLLY_RANGE_CHECK_TO_STRING(value));
   }
   return boost::implicit_cast<Tgt>(value);
 }
@@ -98,11 +160,6 @@ to(const Src & value) {
 
 namespace detail {
 
-template <class T> struct IsSomeString {
-  enum { value = std::is_same<T, std::string>::value
-         || std::is_same<T, fbstring>::value };
-};
-
 template <class T>
 const T& getLastElement(const T & v) {
   return v;
@@ -112,45 +169,162 @@ template <class T, class... Ts>
 typename std::tuple_element<
   sizeof...(Ts),
   std::tuple<T, Ts...> >::type const&
-  getLastElement(const T& v, const Ts&... vs) {
+  getLastElement(const T&, const Ts&... vs) {
   return getLastElement(vs...);
 }
+
+// This class exists to specialize away std::tuple_element in the case where we
+// have 0 template arguments. Without this, Clang/libc++ will blow a
+// static_assert even if tuple_element is protected by an enable_if.
+template <class... Ts>
+struct last_element {
+  typedef typename std::enable_if<
+    sizeof...(Ts) >= 1,
+    typename std::tuple_element<
+      sizeof...(Ts) - 1, std::tuple<Ts...>
+    >::type>::type type;
+};
+
+template <>
+struct last_element<> {
+  typedef void type;
+};
+
+} // namespace detail
 
 /*******************************************************************************
  * Conversions from integral types to string types.
  ******************************************************************************/
 
-// Returns the offset of the formatted string from the start of
-// the supplied buffer. The new string will be at range
-// [buf+begin,buf+bufLen). Uint will be either uint32_t or uint64_t.
-template <class Uint>
-size_t uintToBuffer(char*const buffer, size_t bufLen, Uint v) {
-  extern const char digit1[101], digit2[101];
-  for (;;) {
-    if (v < 100) {
-      if (v < 10) {
-        buffer[--bufLen] = static_cast<char>(v + '0');
-      } else {
-        size_t r = static_cast<size_t>(v);
-        bufLen -= 2;
-        buffer[bufLen] = digit1[r];
-        buffer[bufLen + 1] = digit2[r];
-      }
-      break;
-    }
-    Uint t = v;
-    v /= 100;
-    size_t r = static_cast<size_t> (t - v * 100);
-    bufLen -= 2;
-    buffer[bufLen] = digit1[r];
-    buffer[bufLen + 1] = digit2[r];
-  }
-  return bufLen;
+#if FOLLY_HAVE_INT128_T
+namespace detail {
+
+template <typename IntegerType>
+constexpr unsigned int
+digitsEnough() {
+  return (unsigned int)(ceil(sizeof(IntegerType) * CHAR_BIT * M_LN2 / M_LN10));
 }
 
-const size_t kMaxInt64BufLen = 21;// 19 + 1 for possible '-' sign + 1 for \0
+inline size_t
+unsafeTelescope128(char * buffer, size_t room, unsigned __int128 x) {
+  typedef unsigned __int128 Usrc;
+  size_t p = room - 1;
 
-}                                 // namespace detail
+  while (x >= (Usrc(1) << 64)) { // Using 128-bit division while needed
+    const auto y = x / 10;
+    const auto digit = x % 10;
+
+    buffer[p--] = '0' + digit;
+    x = y;
+  }
+
+  uint64_t xx = x; // Moving to faster 64-bit division thereafter
+
+  while (xx >= 10) {
+    const auto y = xx / 10ULL;
+    const auto digit = xx % 10ULL;
+
+    buffer[p--] = '0' + digit;
+    xx = y;
+  }
+
+  buffer[p] = '0' + xx;
+
+  return p;
+}
+
+}
+#endif
+
+/**
+ * Returns the number of digits in the base 10 representation of an
+ * uint64_t. Useful for preallocating buffers and such. It's also used
+ * internally, see below. Measurements suggest that defining a
+ * separate overload for 32-bit integers is not worthwhile.
+ */
+
+inline uint32_t digits10(uint64_t v) {
+#ifdef __x86_64__
+
+  // For this arch we can get a little help from specialized CPU instructions
+  // which can count leading zeroes; 64 minus that is appx. log (base 2).
+  // Use that to approximate base-10 digits (log_10) and then adjust if needed.
+
+  // 10^i, defined for i 0 through 19.
+  // This is 20 * 8 == 160 bytes, which fits neatly into 5 cache lines
+  // (assuming a cache line size of 64).
+  static const uint64_t powersOf10[20] FOLLY_ALIGNED(64) = {
+    1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000,
+    10000000000, 100000000000, 1000000000000, 10000000000000, 100000000000000,
+    1000000000000000, 10000000000000000, 100000000000000000,
+    1000000000000000000, 10000000000000000000UL
+  };
+
+  // "count leading zeroes" operation not valid; for 0; special case this.
+  if UNLIKELY (! v) {
+    return 1;
+  }
+
+  // bits is in the ballpark of log_2(v).
+  const uint8_t leadingZeroes = __builtin_clzll(v);
+  const auto bits = 63 - leadingZeroes;
+
+  // approximate log_10(v) == log_10(2) * bits.
+  // Integer magic below: 77/256 is appx. 0.3010 (log_10(2)).
+  // The +1 is to make this the ceiling of the log_10 estimate.
+  const uint32_t minLength = 1 + ((bits * 77) >> 8);
+
+  // return that log_10 lower bound, plus adjust if input >= 10^(that bound)
+  // in case there's a small error and we misjudged length.
+  return minLength + (uint32_t) (UNLIKELY (v >= powersOf10[minLength]));
+
+#else
+
+  uint32_t result = 1;
+  for (;;) {
+    if (LIKELY(v < 10)) return result;
+    if (LIKELY(v < 100)) return result + 1;
+    if (LIKELY(v < 1000)) return result + 2;
+    if (LIKELY(v < 10000)) return result + 3;
+    // Skip ahead by 4 orders of magnitude
+    v /= 10000U;
+    result += 4;
+  }
+
+#endif
+}
+
+/**
+ * Copies the ASCII base 10 representation of v into buffer and
+ * returns the number of bytes written. Does NOT append a \0. Assumes
+ * the buffer points to digits10(v) bytes of valid memory. Note that
+ * uint64 needs at most 20 bytes, uint32_t needs at most 10 bytes,
+ * uint16_t needs at most 5 bytes, and so on. Measurements suggest
+ * that defining a separate overload for 32-bit integers is not
+ * worthwhile.
+ *
+ * This primitive is unsafe because it makes the size assumption and
+ * because it does not add a terminating \0.
+ */
+
+inline uint32_t uint64ToBufferUnsafe(uint64_t v, char *const buffer) {
+  auto const result = digits10(v);
+  // WARNING: using size_t or pointer arithmetic for pos slows down
+  // the loop below 20x. This is because several 32-bit ops can be
+  // done in parallel, but only fewer 64-bit ones.
+  uint32_t pos = result - 1;
+  while (v >= 10) {
+    // Keep these together so a peephole optimization "sees" them and
+    // computes them in one shot.
+    auto const q = v / 10;
+    auto const r = static_cast<uint32_t>(v % 10);
+    buffer[pos--] = '0' + r;
+    v = q;
+  }
+  // Last digit is trivial to handle
+  buffer[pos] = static_cast<uint32_t>(v) + '0';
+  return result;
+}
 
 /**
  * A single char gets appended.
@@ -160,13 +334,29 @@ void toAppend(char value, Tgt * result) {
   *result += value;
 }
 
+template<class T>
+constexpr typename std::enable_if<
+  std::is_same<T, char>::value,
+  size_t>::type
+estimateSpaceNeeded(T) {
+  return 1;
+}
+
+/**
+ * Ubiquitous helper template for writing string appenders
+ */
+template <class T> struct IsSomeString {
+  enum { value = std::is_same<T, std::string>::value
+         || std::is_same<T, fbstring>::value };
+};
+
 /**
  * Everything implicitly convertible to const char* gets appended.
  */
 template <class Tgt, class Src>
 typename std::enable_if<
   std::is_convertible<Src, const char*>::value
-  && detail::IsSomeString<Tgt>::value>::type
+  && IsSomeString<Tgt>::value>::type
 toAppend(Src value, Tgt * result) {
   // Treat null pointers like an empty string, as in:
   // operator<<(std::ostream&, const char*).
@@ -176,12 +366,48 @@ toAppend(Src value, Tgt * result) {
   }
 }
 
+template<class Src>
+typename std::enable_if<
+  std::is_convertible<Src, const char*>::value,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  const char *c = value;
+  if (c) {
+    return folly::StringPiece(value).size();
+  };
+  return 0;
+}
+
+template<class Src>
+typename std::enable_if<
+  (std::is_convertible<Src, folly::StringPiece>::value ||
+  IsSomeString<Src>::value) &&
+  !std::is_convertible<Src, const char*>::value,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  return folly::StringPiece(value).size();
+}
+
+template <>
+inline size_t estimateSpaceNeeded(std::nullptr_t /* value */) {
+  return 0;
+}
+
+template<class Src>
+typename std::enable_if<
+  std::is_pointer<Src>::value &&
+  IsSomeString<std::remove_pointer<Src>>::value,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  return value->size();
+}
+
 /**
  * Strings get appended, too.
  */
 template <class Tgt, class Src>
 typename std::enable_if<
-  detail::IsSomeString<Src>::value && detail::IsSomeString<Tgt>::value>::type
+  IsSomeString<Src>::value && IsSomeString<Tgt>::value>::type
 toAppend(const Src& value, Tgt * result) {
   result->append(value);
 }
@@ -191,7 +417,7 @@ toAppend(const Src& value, Tgt * result) {
  */
 template <class Tgt>
 typename std::enable_if<
-   detail::IsSomeString<Tgt>::value>::type
+   IsSomeString<Tgt>::value>::type
 toAppend(StringPiece value, Tgt * result) {
   result->append(value.data(), value.size());
 }
@@ -202,38 +428,98 @@ toAppend(StringPiece value, Tgt * result) {
  */
 template <class Tgt>
 typename std::enable_if<
-   detail::IsSomeString<Tgt>::value>::type
+   IsSomeString<Tgt>::value>::type
 toAppend(const fbstring& value, Tgt * result) {
   result->append(value.data(), value.size());
 }
 
+#if FOLLY_HAVE_INT128_T
+/**
+ * Special handling for 128 bit integers.
+ */
+
+template <class Tgt>
+void
+toAppend(__int128 value, Tgt * result) {
+  typedef unsigned __int128 Usrc;
+  char buffer[detail::digitsEnough<unsigned __int128>() + 1];
+  size_t p;
+
+  if (value < 0) {
+    p = detail::unsafeTelescope128(buffer, sizeof(buffer), Usrc(-value));
+    buffer[--p] = '-';
+  } else {
+    p = detail::unsafeTelescope128(buffer, sizeof(buffer), value);
+  }
+
+  result->append(buffer + p, buffer + sizeof(buffer));
+}
+
+template <class Tgt>
+void
+toAppend(unsigned __int128 value, Tgt * result) {
+  char buffer[detail::digitsEnough<unsigned __int128>()];
+  size_t p;
+
+  p = detail::unsafeTelescope128(buffer, sizeof(buffer), value);
+
+  result->append(buffer + p, buffer + sizeof(buffer));
+}
+
+template<class T>
+constexpr typename std::enable_if<
+  std::is_same<T, __int128>::value,
+  size_t>::type
+estimateSpaceNeeded(T) {
+  return detail::digitsEnough<__int128>();
+}
+
+template<class T>
+constexpr typename std::enable_if<
+  std::is_same<T, unsigned __int128>::value,
+  size_t>::type
+estimateSpaceNeeded(T) {
+  return detail::digitsEnough<unsigned __int128>();
+}
+
+#endif
+
 /**
  * int32_t and int64_t to string (by appending) go through here. The
  * result is APPENDED to a preexisting string passed as the second
- * parameter. For convenience, the function also returns a reference
- * to *result. This should be efficient with fbstring because fbstring
+ * parameter. This should be efficient with fbstring because fbstring
  * incurs no dynamic allocation below 23 bytes and no number has more
  * than 22 bytes in its textual representation (20 for digits, one for
  * sign, one for the terminating 0).
  */
 template <class Tgt, class Src>
 typename std::enable_if<
-  std::is_integral<Src>::value && std::is_signed<Src>::value
-  && detail::IsSomeString<Tgt>::value && sizeof(Src) >= 4>::type
+  std::is_integral<Src>::value && std::is_signed<Src>::value &&
+  IsSomeString<Tgt>::value && sizeof(Src) >= 4>::type
 toAppend(Src value, Tgt * result) {
-  typedef typename std::make_unsigned<Src>::type Usrc;
-  char buffer[detail::kMaxInt64BufLen];
-  size_t begin;
+  char buffer[20];
   if (value < 0) {
-    begin = detail::uintToBuffer(buffer, sizeof(buffer),
-                                 static_cast<Usrc>(-value));
-    DCHECK_GE(begin, 1);
-    buffer[--begin] = '-';
+    result->push_back('-');
+    result->append(buffer, uint64ToBufferUnsafe(-uint64_t(value), buffer));
   } else {
-    begin = detail::uintToBuffer(buffer, sizeof(buffer),
-                                 static_cast<Usrc>(value));
+    result->append(buffer, uint64ToBufferUnsafe(value, buffer));
   }
-  result->append(buffer + begin, buffer + sizeof(buffer));
+}
+
+template <class Src>
+typename std::enable_if<
+  std::is_integral<Src>::value && std::is_signed<Src>::value
+  && sizeof(Src) >= 4 && sizeof(Src) < 16,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  if (value < 0) {
+    // When "value" is the smallest negative, negating it would evoke
+    // undefined behavior, so, instead of writing "-value" below, we write
+    // "~static_cast<uint64_t>(value) + 1"
+    return 1 + digits10(~static_cast<uint64_t>(value) + 1);
+  }
+
+  return digits10(static_cast<uint64_t>(value));
 }
 
 /**
@@ -242,11 +528,19 @@ toAppend(Src value, Tgt * result) {
 template <class Tgt, class Src>
 typename std::enable_if<
   std::is_integral<Src>::value && !std::is_signed<Src>::value
-  && detail::IsSomeString<Tgt>::value && sizeof(Src) >= 4>::type
+  && IsSomeString<Tgt>::value && sizeof(Src) >= 4>::type
 toAppend(Src value, Tgt * result) {
-  char buffer[detail::kMaxInt64BufLen];
-  const size_t begin = detail::uintToBuffer(buffer, sizeof(buffer), value);
-  result->append(buffer + begin, buffer + sizeof(buffer));
+  char buffer[20];
+  result->append(buffer, buffer + uint64ToBufferUnsafe(value, buffer));
+}
+
+template <class Src>
+typename std::enable_if<
+  std::is_integral<Src>::value && !std::is_signed<Src>::value
+  && sizeof(Src) >= 4 && sizeof(Src) < 16,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  return digits10(value);
 }
 
 /**
@@ -256,7 +550,7 @@ toAppend(Src value, Tgt * result) {
 template <class Tgt, class Src>
 typename std::enable_if<
   std::is_integral<Src>::value
-  && detail::IsSomeString<Tgt>::value && sizeof(Src) < 4>::type
+  && IsSomeString<Tgt>::value && sizeof(Src) < 4>::type
 toAppend(Src value, Tgt * result) {
   typedef typename
     std::conditional<std::is_signed<Src>::value, int64_t, uint64_t>::type
@@ -264,37 +558,52 @@ toAppend(Src value, Tgt * result) {
   toAppend<Tgt>(static_cast<Intermediate>(value), result);
 }
 
+template <class Src>
+typename std::enable_if<
+  std::is_integral<Src>::value
+  && sizeof(Src) < 4
+  && !std::is_same<Src, char>::value,
+  size_t>::type
+estimateSpaceNeeded(Src value) {
+  typedef typename
+    std::conditional<std::is_signed<Src>::value, int64_t, uint64_t>::type
+    Intermediate;
+  return estimateSpaceNeeded(static_cast<Intermediate>(value));
+}
+
 /**
  * Enumerated values get appended as integers.
  */
 template <class Tgt, class Src>
 typename std::enable_if<
-  std::is_enum<Src>::value && detail::IsSomeString<Tgt>::value>::type
+  std::is_enum<Src>::value && IsSomeString<Tgt>::value>::type
 toAppend(Src value, Tgt * result) {
-  /* static */ if (Src(-1) < 0) {
-    /* static */ if (sizeof(Src) <= sizeof(int)) {
-      toAppend(static_cast<int>(value), result);
-    } else {
-      toAppend(static_cast<long>(value), result);
-    }
-  } else {
-    /* static */ if (sizeof(Src) <= sizeof(int)) {
-      toAppend(static_cast<unsigned int>(value), result);
-    } else {
-      toAppend(static_cast<unsigned long>(value), result);
-    }
-  }
+  toAppend(
+      static_cast<typename std::underlying_type<Src>::type>(value), result);
+}
+
+template <class Src>
+typename std::enable_if<
+  std::is_enum<Src>::value, size_t>::type
+estimateSpaceNeeded(Src value) {
+  return estimateSpaceNeeded(
+      static_cast<typename std::underlying_type<Src>::type>(value));
 }
 
 /*******************************************************************************
  * Conversions from floating-point types to string types.
  ******************************************************************************/
 
+namespace detail {
+constexpr int kConvMaxDecimalInShortestLow = -6;
+constexpr int kConvMaxDecimalInShortestHigh = 21;
+} // folly::detail
+
 /** Wrapper around DoubleToStringConverter **/
 template <class Tgt, class Src>
 typename std::enable_if<
   std::is_floating_point<Src>::value
-  && detail::IsSomeString<Tgt>::value>::type
+  && IsSomeString<Tgt>::value>::type
 toAppend(
   Src value,
   Tgt * result,
@@ -303,9 +612,9 @@ toAppend(
   using namespace double_conversion;
   DoubleToStringConverter
     conv(DoubleToStringConverter::NO_FLAGS,
-         "infinity", "NaN", 'E',
-         -6,  // decimal in shortest low
-         21,  // decimal in shortest high
+         "Infinity", "NaN", 'E',
+         detail::kConvMaxDecimalInShortestLow,
+         detail::kConvMaxDecimalInShortestHigh,
          6,   // max leading padding zeros
          1);  // max trailing padding zeros
   char buffer[256];
@@ -333,44 +642,274 @@ toAppend(
 template <class Tgt, class Src>
 typename std::enable_if<
   std::is_floating_point<Src>::value
-  && detail::IsSomeString<Tgt>::value>::type
+  && IsSomeString<Tgt>::value>::type
 toAppend(Src value, Tgt * result) {
   toAppend(
     value, result, double_conversion::DoubleToStringConverter::SHORTEST, 0);
 }
 
 /**
- * Variadic conversion to string. Appends each element in turn.
+ * Upper bound of the length of the output from
+ * DoubleToStringConverter::ToShortest(double, StringBuilder*),
+ * as used in toAppend(double, string*).
  */
+template <class Src>
+typename std::enable_if<
+  std::is_floating_point<Src>::value, size_t>::type
+estimateSpaceNeeded(Src value) {
+  // kBase10MaximalLength is 17. We add 1 for decimal point,
+  // e.g. 10.0/9 is 17 digits and 18 characters, including the decimal point.
+  constexpr int kMaxMantissaSpace =
+    double_conversion::DoubleToStringConverter::kBase10MaximalLength + 1;
+  // strlen("E-") + digits10(numeric_limits<double>::max_exponent10)
+  constexpr int kMaxExponentSpace = 2 + 3;
+  static const int kMaxPositiveSpace = std::max({
+      // E.g. 1.1111111111111111E-100.
+      kMaxMantissaSpace + kMaxExponentSpace,
+      // E.g. 0.000001.1111111111111111, if kConvMaxDecimalInShortestLow is -6.
+      kMaxMantissaSpace - detail::kConvMaxDecimalInShortestLow,
+      // If kConvMaxDecimalInShortestHigh is 21, then 1e21 is the smallest
+      // number > 1 which ToShortest outputs in exponential notation,
+      // so 21 is the longest non-exponential number > 1.
+      detail::kConvMaxDecimalInShortestHigh
+    });
+  return kMaxPositiveSpace + (value < 0);  // +1 for minus sign, if negative
+}
+
+/**
+ * This can be specialized, together with adding specialization
+ * for estimateSpaceNeed for your type, so that we allocate
+ * as much as you need instead of the default
+ */
+template<class Src>
+struct HasLengthEstimator : std::false_type {};
+
+template <class Src>
+constexpr typename std::enable_if<
+  !std::is_fundamental<Src>::value
+#ifdef FOLLY_HAVE_INT128_T
+  // On OSX 10.10, is_fundamental<__int128> is false :-O
+  && !std::is_same<__int128, Src>::value
+  && !std::is_same<unsigned __int128, Src>::value
+#endif
+  && !IsSomeString<Src>::value
+  && !std::is_convertible<Src, const char*>::value
+  && !std::is_convertible<Src, StringPiece>::value
+  && !std::is_enum<Src>::value
+  && !HasLengthEstimator<Src>::value,
+  size_t>::type
+estimateSpaceNeeded(const Src&) {
+  return sizeof(Src) + 1; // dumbest best effort ever?
+}
+
+namespace detail {
+
+inline size_t estimateSpaceToReserve(size_t sofar) {
+  return sofar;
+}
+
+template <class T, class... Ts>
+size_t estimateSpaceToReserve(size_t sofar, const T& v, const Ts&... vs) {
+  return estimateSpaceToReserve(sofar + estimateSpaceNeeded(v), vs...);
+}
+
+template<class T>
+size_t estimateSpaceToReserve(size_t sofar, const T& v) {
+  return sofar + estimateSpaceNeeded(v);
+}
+
+template<class...Ts>
+void reserveInTarget(const Ts&...vs) {
+  getLastElement(vs...)->reserve(estimateSpaceToReserve(0, vs...));
+}
+
+template<class Delimiter, class...Ts>
+void reserveInTargetDelim(const Delimiter& d, const Ts&...vs) {
+  static_assert(sizeof...(vs) >= 2, "Needs at least 2 args");
+  size_t fordelim = (sizeof...(vs) - 2) * estimateSpaceToReserve(0, d);
+  getLastElement(vs...)->reserve(estimateSpaceToReserve(fordelim, vs...));
+}
+
+/**
+ * Variadic base case: append one element
+ */
+template <class T, class Tgt>
+typename std::enable_if<
+  IsSomeString<typename std::remove_pointer<Tgt>::type>
+  ::value>::type
+toAppendStrImpl(const T& v, Tgt result) {
+  toAppend(v, result);
+}
+
 template <class T, class... Ts>
 typename std::enable_if<sizeof...(Ts) >= 2
-  && detail::IsSomeString<
+  && IsSomeString<
   typename std::remove_pointer<
-    typename std::tuple_element<
-      sizeof...(Ts) - 1, std::tuple<Ts...>
-      >::type>::type>::value>::type
-toAppend(const T& v, const Ts&... vs) {
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppendStrImpl(const T& v, const Ts&... vs) {
+  toAppend(v, getLastElement(vs...));
+  toAppendStrImpl(vs...);
+}
+
+template <class Delimiter, class T, class Tgt>
+typename std::enable_if<
+    IsSomeString<typename std::remove_pointer<Tgt>::type>::value>::type
+toAppendDelimStrImpl(const Delimiter& /* delim */, const T& v, Tgt result) {
+  toAppend(v, result);
+}
+
+template <class Delimiter, class T, class... Ts>
+typename std::enable_if<sizeof...(Ts) >= 2
+  && IsSomeString<
+  typename std::remove_pointer<
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppendDelimStrImpl(const Delimiter& delim, const T& v, const Ts&... vs) {
+  // we are really careful here, calling toAppend with just one element does
+  // not try to estimate space needed (as we already did that). If we call
+  // toAppend(v, delim, ....) we would do unnecesary size calculation
   toAppend(v, detail::getLastElement(vs...));
+  toAppend(delim, detail::getLastElement(vs...));
+  toAppendDelimStrImpl(delim, vs...);
+}
+} // folly::detail
+
+
+/**
+ * Variadic conversion to string. Appends each element in turn.
+ * If we have two or more things to append, we it will not reserve
+ * the space for them and will depend on strings exponential growth.
+ * If you just append once consider using toAppendFit which reserves
+ * the space needed (but does not have exponential as a result).
+ */
+template <class... Ts>
+typename std::enable_if<sizeof...(Ts) >= 3
+  && IsSomeString<
+  typename std::remove_pointer<
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppend(const Ts&... vs) {
+  ::folly::detail::toAppendStrImpl(vs...);
+}
+
+/**
+ * Special version of the call that preallocates exaclty as much memory
+ * as need for arguments to be stored in target. This means we are
+ * not doing exponential growth when we append. If you are using it
+ * in a loop you are aiming at your foot with a big perf-destroying
+ * bazooka.
+ * On the other hand if you are appending to a string once, this
+ * will probably save a few calls to malloc.
+ */
+template <class... Ts>
+typename std::enable_if<
+  IsSomeString<
+  typename std::remove_pointer<
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppendFit(const Ts&... vs) {
+  ::folly::detail::reserveInTarget(vs...);
   toAppend(vs...);
 }
+
+template <class Ts>
+void toAppendFit(const Ts&) {}
 
 /**
  * Variadic base case: do nothing.
  */
 template <class Tgt>
-typename std::enable_if<detail::IsSomeString<Tgt>::value>::type
-toAppend(Tgt* result) {
+typename std::enable_if<IsSomeString<Tgt>::value>::type toAppend(
+    Tgt* /* result */) {}
+
+/**
+ * Variadic base case: do nothing.
+ */
+template <class Delimiter, class Tgt>
+typename std::enable_if<IsSomeString<Tgt>::value>::type toAppendDelim(
+    const Delimiter& /* delim */, Tgt* /* result */) {}
+
+/**
+ * 1 element: same as toAppend.
+ */
+template <class Delimiter, class T, class Tgt>
+typename std::enable_if<IsSomeString<Tgt>::value>::type toAppendDelim(
+    const Delimiter& /* delim */, const T& v, Tgt* tgt) {
+  toAppend(v, tgt);
 }
+
+/**
+ * Append to string with a delimiter in between elements. Check out
+ * comments for toAppend for details about memory allocation.
+ */
+template <class Delimiter, class... Ts>
+typename std::enable_if<sizeof...(Ts) >= 3
+  && IsSomeString<
+  typename std::remove_pointer<
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppendDelim(const Delimiter& delim, const Ts&... vs) {
+  detail::toAppendDelimStrImpl(delim, vs...);
+}
+
+/**
+ * Detail in comment for toAppendFit
+ */
+template <class Delimiter, class... Ts>
+typename std::enable_if<
+  IsSomeString<
+  typename std::remove_pointer<
+    typename detail::last_element<Ts...>::type
+  >::type>::value>::type
+toAppendDelimFit(const Delimiter& delim, const Ts&... vs) {
+  detail::reserveInTargetDelim(delim, vs...);
+  toAppendDelim(delim, vs...);
+}
+
+template <class De, class Ts>
+void toAppendDelimFit(const De&, const Ts&) {}
 
 /**
  * to<SomeString>(v1, v2, ...) uses toAppend() (see below) as back-end
  * for all types.
  */
 template <class Tgt, class... Ts>
-typename std::enable_if<detail::IsSomeString<Tgt>::value, Tgt>::type
+typename std::enable_if<
+  IsSomeString<Tgt>::value && (
+    sizeof...(Ts) != 1 ||
+    !std::is_same<Tgt, typename detail::last_element<Ts...>::type>::value),
+  Tgt>::type
 to(const Ts&... vs) {
   Tgt result;
-  toAppend(vs..., &result);
+  toAppendFit(vs..., &result);
+  return result;
+}
+
+/**
+ * toDelim<SomeString>(SomeString str) returns itself.
+ */
+template <class Tgt, class Delim, class Src>
+typename std::enable_if<IsSomeString<Tgt>::value &&
+                            std::is_same<Tgt, Src>::value,
+                        Tgt>::type
+toDelim(const Delim& /* delim */, const Src& value) {
+  return value;
+}
+
+/**
+ * toDelim<SomeString>(delim, v1, v2, ...) uses toAppendDelim() as
+ * back-end for all types.
+ */
+template <class Tgt, class Delim, class... Ts>
+typename std::enable_if<
+  IsSomeString<Tgt>::value && (
+    sizeof...(Ts) != 1 ||
+    !std::is_same<Tgt, typename detail::last_element<Ts...>::type>::value),
+  Tgt>::type
+toDelim(const Delim& delim, const Ts&... vs) {
+  Tgt result;
+  toAppendDelimFit(delim, vs..., &result);
   return result;
 }
 
@@ -407,116 +946,25 @@ namespace detail {
     static const char*const value;
   };
 
-/**
- * String represented as a pair of pointers to char to unsigned
- * integrals. Assumes NO whitespace before or after, and also that the
- * string is composed entirely of digits. Tgt must be unsigned, and no
- * sign is allowed in the string (even it's '+'). String may be empty,
- * in which case digits_to throws.
- */
+  bool str_to_bool(StringPiece* src);
+
   template <class Tgt>
-  Tgt digits_to(const char * b, const char * e) {
+  Tgt digits_to(const char* b, const char* e);
 
-    static_assert(!std::is_signed<Tgt>::value, "Unsigned type expected");
-    assert(b <= e);
-
-    const size_t size = e - b;
-
-    /* Although the string is entirely made of digits, we still need to
-     * check for overflow.
-     */
-    if (size >= std::numeric_limits<Tgt>::digits10 + 1) {
-      // Leading zeros? If so, recurse to keep things simple
-      if (b < e && *b == '0') {
-        for (++b;; ++b) {
-          if (b == e) return 0; // just zeros, e.g. "0000"
-          if (*b != '0') return digits_to<Tgt>(b, e);
-        }
-      }
-      FOLLY_RANGE_CHECK(size == std::numeric_limits<Tgt>::digits10 + 1 &&
-                        strncmp(b, detail::MaxString<Tgt>::value, size) <= 0,
-                        "Numeric overflow upon conversion");
-    }
-
-    // Here we know that the number won't overflow when
-    // converted. Proceed without checks.
-
-    static const Tgt power10[20] = {
-      static_cast<Tgt>(10000000000000000000UL),
-      static_cast<Tgt>(1000000000000000000UL),
-      static_cast<Tgt>(100000000000000000UL),
-      static_cast<Tgt>(10000000000000000UL),
-      static_cast<Tgt>(1000000000000000UL),
-      static_cast<Tgt>(100000000000000UL),
-      static_cast<Tgt>(10000000000000UL),
-      static_cast<Tgt>(1000000000000UL),
-      static_cast<Tgt>(100000000000UL),
-      static_cast<Tgt>(10000000000UL),
-      static_cast<Tgt>(1000000000UL),
-      static_cast<Tgt>(100000000UL),
-      static_cast<Tgt>(10000000UL),
-      static_cast<Tgt>(1000000UL),
-      static_cast<Tgt>(100000UL),
-      static_cast<Tgt>(10000UL),
-      static_cast<Tgt>(1000UL),
-      static_cast<Tgt>(100UL),
-      static_cast<Tgt>(10UL),
-      static_cast<Tgt>(1UL),
-    };
-
-    size_t powIdx = sizeof(power10) / sizeof(*power10) - size;
-    Tgt result = 0;
-
-    for (; e - b >= 4; b += 4, powIdx += 4) {
-      const auto c0 = static_cast<unsigned>(*b) - '0';
-      if (c0 >= 10) goto failure;
-      const auto r0 = power10[powIdx] * c0;
-      const auto c1 = static_cast<unsigned>(b[1]) - '0';
-      if (c1 >= 10) goto failure;
-      const auto r1 = power10[powIdx + 1] * c1;
-      const auto c2 = static_cast<unsigned>(b[2]) - '0';
-      if (c2 >= 10) goto failure;
-      const auto r2 = power10[powIdx + 2] * c2;
-      const auto c3 = static_cast<unsigned>(b[3]) - '0';
-      if (c3 >= 10) goto failure;
-      const auto r3 = power10[powIdx + 3] * c3;
-      result += r0 + r1 + r2 + r3;
-    }
-
-    switch (e - b) {
-      case 3: {
-        const auto c0 = static_cast<unsigned>(*b) - '0';
-        if (c0 >= 10) goto failure;
-        const auto c1 = static_cast<unsigned>(b[1]) - '0';
-        if (c1 >= 10) goto failure;
-        const auto c2 = static_cast<unsigned>(b[2]) - '0';
-        if (c2 >= 10) goto failure;
-        return result + 100 * c0 + 10 * c1 + c2;
-      }
-      case 2: {
-        const auto c0 = static_cast<unsigned>(*b) - '0';
-        if (c0 >= 10) goto failure;
-        const auto c1 = static_cast<unsigned>(b[1]) - '0';
-        if (c1 >= 10) goto failure;
-        return result + 10 * c0 + c1;
-      }
-      case 1: {
-        const auto c0 = static_cast<unsigned>(*b) - '0';
-        if (c0 >= 10) goto failure;
-        return result + c0;
-      }
-    }
-
-    assert(b == e);
-    FOLLY_RANGE_CHECK(size > 0, "Found no digits to convert in input");
-    return result;
-
-    failure:
-    throw std::range_error("Cannot convert string " +
-                           std::string(e - size, e) + " to integral.");
-  }
-
-  bool str_to_bool(StringPiece * src);
+  extern template unsigned char digits_to<unsigned char>(const char* b,
+                                                         const char* e);
+  extern template unsigned short digits_to<unsigned short>(const char* b,
+                                                           const char* e);
+  extern template unsigned int digits_to<unsigned int>(const char* b,
+                                                       const char* e);
+  extern template unsigned long digits_to<unsigned long>(const char* b,
+                                                         const char* e);
+  extern template unsigned long long digits_to<unsigned long long>(
+      const char* b, const char* e);
+#if FOLLY_HAVE_INT128_T
+  extern template unsigned __int128 digits_to<unsigned __int128>(const char* b,
+                                                                 const char* e);
+#endif
 
 }                                 // namespace detail
 
@@ -543,18 +991,19 @@ typename std::enable_if<
   std::is_integral<Tgt>::value && std::is_signed<Tgt>::value,
   Tgt>::type
 to(const char * b, const char * e) {
-  FOLLY_RANGE_CHECK(b < e, "Empty input string in conversion to integral");
+  FOLLY_RANGE_CHECK(b < e, "Empty input string in conversion to integral",
+                    to<std::string>("b: ", intptr_t(b), " e: ", intptr_t(e)));
   if (!isdigit(*b)) {
     if (*b == '-') {
       Tgt result = -to<typename std::make_unsigned<Tgt>::type>(b + 1, e);
-      FOLLY_RANGE_CHECK(result <= 0, "Negative overflow.");
+      FOLLY_RANGE_CHECK_BEGIN_END(result <= 0, "Negative overflow.", b, e);
       return result;
     }
-    FOLLY_RANGE_CHECK(*b == '+', "Invalid lead character");
+    FOLLY_RANGE_CHECK_BEGIN_END(*b == '+', "Invalid lead character", b, e);
     ++b;
   }
   Tgt result = to<typename std::make_unsigned<Tgt>::type>(b, e);
-  FOLLY_RANGE_CHECK(result >= 0, "Overflow.");
+  FOLLY_RANGE_CHECK_BEGIN_END(result >= 0, "Overflow", b, e);
   return result;
 }
 
@@ -577,7 +1026,8 @@ to(StringPiece * src) {
 
   auto b = src->data(), past = src->data() + src->size();
   for (;; ++b) {
-    FOLLY_RANGE_CHECK(b < past, "No digits found in input string");
+    FOLLY_RANGE_CHECK_STRINGPIECE(b < past,
+                                  "No digits found in input string", *src);
     if (!isspace(*b)) break;
   }
 
@@ -590,15 +1040,16 @@ to(StringPiece * src) {
       if (*m == '-') {
         negative = true;
       } else {
-        FOLLY_RANGE_CHECK(*m == '+', "Invalid leading character in conversion"
-                          " to integral");
+        FOLLY_RANGE_CHECK_STRINGPIECE(*m == '+', "Invalid leading character in "
+                                      "conversion to integral", *src);
       }
       ++b;
       ++m;
     }
   }
-  FOLLY_RANGE_CHECK(m < past, "No digits found in input string");
-  FOLLY_RANGE_CHECK(isdigit(*m), "Non-digit character found");
+  FOLLY_RANGE_CHECK_STRINGPIECE(m < past, "No digits found in input string",
+                                *src);
+  FOLLY_RANGE_CHECK_STRINGPIECE(isdigit(*m), "Non-digit character found", *src);
   m = detail::findFirstNonDigit<Tgt>(m + 1, past);
 
   Tgt result;
@@ -608,10 +1059,11 @@ to(StringPiece * src) {
     auto t = detail::digits_to<typename std::make_unsigned<Tgt>::type>(b, m);
     if (negative) {
       result = -t;
-      FOLLY_RANGE_CHECK(result <= 0, "Negative overflow");
+      FOLLY_RANGE_CHECK_STRINGPIECE(is_non_positive(result),
+                                    "Negative overflow", *src);
     } else {
       result = t;
-      FOLLY_RANGE_CHECK(result >= 0, "Overflow");
+      FOLLY_RANGE_CHECK_STRINGPIECE(is_non_negative(result), "Overflow", *src);
     }
   }
   src->advance(m - src->data());
@@ -637,7 +1089,9 @@ namespace detail {
  */
 inline void enforceWhitespace(const char* b, const char* e) {
   for (; b != e; ++b) {
-    FOLLY_RANGE_CHECK(isspace(*b), to<std::string>("Non-whitespace: ", *b));
+    FOLLY_RANGE_CHECK_BEGIN_END(isspace(*b),
+                                to<std::string>("Non-whitespace: ", *b),
+                                b, e);
   }
 }
 
@@ -679,11 +1133,13 @@ to(StringPiece *const src) {
          std::numeric_limits<double>::quiet_NaN(),
          nullptr, nullptr);
 
-  FOLLY_RANGE_CHECK(!src->empty(), "No digits found in input string");
+  FOLLY_RANGE_CHECK_STRINGPIECE(!src->empty(),
+                                "No digits found in input string", *src);
 
   int length;
-  auto result = conv.StringToDouble(src->data(), src->size(),
-                                       &length); // processed char count
+  auto result = conv.StringToDouble(src->data(),
+                                    static_cast<int>(src->size()),
+                                    &length); // processed char count
 
   if (!std::isnan(result)) {
     src->advance(length);
@@ -740,6 +1196,16 @@ to(StringPiece *const src) {
     return std::numeric_limits<Tgt>::quiet_NaN();
   }
 
+  // "-nan"?
+  if (src->size() >= 4 &&
+      toupper((*src)[0]) == '-' &&
+      toupper((*src)[1]) == 'N' &&
+      toupper((*src)[2]) == 'A' &&
+      toupper((*src)[3]) == 'N') {
+    src->advance(4);
+    return -std::numeric_limits<Tgt>::quiet_NaN();
+  }
+
   // All bets are off
   throw std::range_error("Unable to convert \"" + src->toString()
                          + "\" to a floating point value.");
@@ -753,7 +1219,7 @@ typename std::enable_if<
   std::is_floating_point<Tgt>::value,
   Tgt>::type
 to(StringPiece src) {
-  Tgt result = to<double>(&src);
+  Tgt result = Tgt(to<double>(&src));
   detail::enforceWhitespace(src.data(), src.data() + src.size());
   return result;
 }
@@ -763,7 +1229,7 @@ to(StringPiece src) {
  ******************************************************************************/
 
 /**
- * Checked conversion from integral to flating point and back. The
+ * Checked conversion from integral to floating point and back. The
  * result must be convertible back to the source type without loss of
  * precision. This seems Draconian but sometimes is what's needed, and
  * complements existing routines nicely. For various rounding
@@ -776,12 +1242,17 @@ typename std::enable_if<
   (std::is_floating_point<Src>::value && std::is_integral<Tgt>::value),
   Tgt>::type
 to(const Src & value) {
-  Tgt result = value;
+  Tgt result = Tgt(value);
   auto witness = static_cast<Src>(result);
   if (value != witness) {
     throw std::range_error(
       to<std::string>("to<>: loss of precision when converting ", value,
-                      " to type ", typeid(Tgt).name()).c_str());
+#ifdef FOLLY_HAS_RTTI
+                      " to type ", typeid(Tgt).name()
+#else
+                      " to other type"
+#endif
+                      ).c_str());
   }
   return result;
 }
@@ -791,45 +1262,17 @@ to(const Src & value) {
  ******************************************************************************/
 
 template <class Tgt, class Src>
-typename std::enable_if<std::is_enum<Src>::value, Tgt>::type
+typename std::enable_if<
+  std::is_enum<Src>::value && !std::is_same<Src, Tgt>::value, Tgt>::type
 to(const Src & value) {
-  // TODO: uncomment this when underlying_type is available
-  // return to<Tgt>(static_cast<typename std::underlying_type<Src>::type>(
-  //    value));
-  /* static */ if (Src(-1) < 0) {
-    /* static */ if (sizeof(Src) <= sizeof(int)) {
-      return to<Tgt>(static_cast<int>(value));
-    } else {
-      return to<Tgt>(static_cast<long>(value));
-    }
-  } else {
-    /* static */ if (sizeof(Src) <= sizeof(int)) {
-      return to<Tgt>(static_cast<unsigned int>(value));
-    } else {
-      return to<Tgt>(static_cast<unsigned long>(value));
-    }
-  }
+  return to<Tgt>(static_cast<typename std::underlying_type<Src>::type>(value));
 }
 
 template <class Tgt, class Src>
-typename std::enable_if<std::is_enum<Tgt>::value, Tgt>::type
+typename std::enable_if<
+  std::is_enum<Tgt>::value && !std::is_same<Src, Tgt>::value, Tgt>::type
 to(const Src & value) {
-  // TODO: uncomment this when underlying_type is available
-  // return static_cast<Tgt>(
-  //    to<typename std::underlying_type<Tgt>::type>(value));
-  /* static */ if (Tgt(-1) < 0) {
-    /* static */ if (sizeof(Tgt) <= sizeof(int)) {
-      return static_cast<Tgt>(to<int>(value));
-    } else {
-      return static_cast<Tgt>(to<long>(value));
-    }
-  } else {
-    /* static */ if (sizeof(Tgt) <= sizeof(int)) {
-      return static_cast<Tgt>(to<unsigned int>(value));
-    } else {
-      return static_cast<Tgt>(to<unsigned long>(value));
-    }
-  }
+  return static_cast<Tgt>(to<typename std::underlying_type<Tgt>::type>(value));
 }
 
 } // namespace folly
@@ -839,6 +1282,10 @@ to(const Src & value) {
 // to avoid defining this global macro name in other files that include Conv.h.
 #ifndef FOLLY_CONV_INTERNAL
 #undef FOLLY_RANGE_CHECK
+#undef FOLLY_RANGE_CHECK_BEGIN_END
+#undef FOLLY_RANGE_CHECK_STRINGPIECE
+#undef FOLLY_RANGE_CHECK_STRINGIZE
+#undef FOLLY_RANGE_CHECK_STRINGIZE2
 #endif
 
 #endif /* FOLLY_BASE_CONV_H_ */

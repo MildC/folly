@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "folly/DiscriminatedPtr.h"
+#include <folly/DiscriminatedPtr.h>
 
 #include <gtest/gtest.h>
 
@@ -44,7 +44,7 @@ TEST(DiscriminatedPtr, Basic) {
   EXPECT_EQ(&a, static_cast<const Ptr&>(p).get_nothrow<int>());
   EXPECT_EQ(&a, p.get<int>());
   EXPECT_EQ(&a, static_cast<const Ptr&>(p).get<int>());
-  EXPECT_EQ(static_cast<void*>(NULL), p.get_nothrow<void>());
+  EXPECT_EQ(static_cast<void*>(nullptr), p.get_nothrow<void>());
   EXPECT_THROW({p.get<void>();}, std::invalid_argument);
 
   Foo foo;
@@ -55,7 +55,7 @@ TEST(DiscriminatedPtr, Basic) {
   EXPECT_TRUE(p.hasType<Foo>());
   EXPECT_FALSE(p.hasType<Bar>());
 
-  EXPECT_EQ(static_cast<int*>(NULL), p.get_nothrow<int>());
+  EXPECT_EQ(static_cast<int*>(nullptr), p.get_nothrow<int>());
 
   p.clear();
   EXPECT_TRUE(p.empty());
@@ -68,10 +68,10 @@ TEST(DiscriminatedPtr, Basic) {
 TEST(DiscriminatedPtr, Apply) {
   struct Foo { };
   struct Visitor {
-    std::string operator()(int* ptr) { return "int"; }
-    std::string operator()(const int* ptr) { return "const int"; }
-    std::string operator()(Foo* ptr) { return "Foo"; }
-    std::string operator()(const Foo* ptr) { return "const Foo"; }
+    std::string operator()(int* /* ptr */) { return "int"; }
+    std::string operator()(const int* /* ptr */) { return "const int"; }
+    std::string operator()(Foo* /* ptr */) { return "Foo"; }
+    std::string operator()(const Foo* /* ptr */) { return "const Foo"; }
   };
 
   typedef DiscriminatedPtr<int, Foo> Ptr;
@@ -94,10 +94,10 @@ TEST(DiscriminatedPtr, Apply) {
 TEST(DiscriminatedPtr, ApplyVoid) {
   struct Foo { };
   struct Visitor {
-    void operator()(int* ptr) { result = "int"; }
-    void operator()(const int* ptr) { result = "const int"; }
-    void operator()(Foo* ptr) { result = "Foo"; }
-    void operator()(const Foo* ptr) { result = "const Foo"; }
+    void operator()(int* /* ptr */) { result = "int"; }
+    void operator()(const int* /* ptr */) { result = "const int"; }
+    void operator()(Foo* /* ptr */) { result = "Foo"; }
+    void operator()(const Foo* /* ptr */) { result = "const Foo"; }
 
     std::string result;
   };

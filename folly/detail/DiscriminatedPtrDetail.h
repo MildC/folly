@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #ifndef FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_
 #define FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_
 
+#include <utility>
 #include <type_traits>
 
 namespace folly {
@@ -114,7 +115,7 @@ template <typename V, typename R, typename... Types> struct ApplyVisitor1;
 
 template <typename V, typename R>
 struct ApplyVisitor1<V, R> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
+  R operator()(size_t /* index */, V&& /* visitor */, void* /* ptr */) const {
     CHECK(false);  // NOTREACHED
   }
 };
@@ -132,7 +133,7 @@ template <typename V, typename R, typename... Types> struct ApplyConstVisitor1;
 
 template <typename V, typename R>
 struct ApplyConstVisitor1<V, R> {
-  R operator()(size_t index, V&& visitor, void* ptr) const {
+  R operator()(size_t /* index */, V&& /* visitor */, void* /* ptr */) const {
     CHECK(false);  // NOTREACHED
   }
 };
@@ -162,4 +163,3 @@ struct ApplyConstVisitor
 }  // namespace folly
 
 #endif /* FOLLY_DETAIL_DISCRIMINATEDPTRDETAIL_H_ */
-

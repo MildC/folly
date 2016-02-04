@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,11 +18,18 @@
 #define FOLLY_FORMATARG_H_
 
 #include <stdexcept>
-#include "folly/Range.h"
-#include "folly/Likely.h"
-#include "folly/Conv.h"
+#include <folly/Conv.h>
+#include <folly/Likely.h>
+#include <folly/Portability.h>
+#include <folly/Range.h>
 
 namespace folly {
+
+class BadFormatArg : public std::invalid_argument {
+ public:
+  explicit BadFormatArg(const std::string& msg)
+    : std::invalid_argument(msg) {}
+};
 
 /**
  * Parsed format argument.
@@ -39,7 +46,9 @@ struct FormatArg {
       sign(Sign::DEFAULT),
       basePrefix(false),
       thousandsSeparator(false),
+      trailingDot(false),
       width(kDefaultWidth),
+      widthIndex(kNoIndex),
       precision(kDefaultPrecision),
       presentation(kDefaultPresentation),
       nextKeyMode_(NextKeyMode::NONE) {
@@ -71,7 +80,10 @@ struct FormatArg {
   }
 
   template <typename... Args>
-  void error(Args&&... args) const __attribute__((noreturn));
+  std::string errorStr(Args&&... args) const;
+  template <typename... Args>
+  FOLLY_NORETURN void error(Args&&... args) const;
+
   /**
    * Full argument string, as passed in to the constructor.
    */
@@ -119,10 +131,18 @@ struct FormatArg {
   bool thousandsSeparator;
 
   /**
-   * Field width
+   * Force a trailing decimal on doubles which could be rendered as ints
+   */
+  bool trailingDot;
+
+  /**
+   * Field width and optional argument index
    */
   static constexpr int kDefaultWidth = -1;
+  static constexpr int kDynamicWidth = -2;
+  static constexpr int kNoIndex = -1;
   int width;
+  int widthIndex;
 
   /**
    * Precision
@@ -185,10 +205,15 @@ struct FormatArg {
 };
 
 template <typename... Args>
+inline std::string FormatArg::errorStr(Args&&... args) const {
+  return to<std::string>(
+    "invalid format argument {", fullArgString, "}: ",
+    std::forward<Args>(args)...);
+}
+
+template <typename... Args>
 inline void FormatArg::error(Args&&... args) const {
-  throw std::invalid_argument(to<std::string>(
-      "folly::format: invalid format argument {", fullArgString, "}: ",
-      std::forward<Args>(args)...));
+  throw BadFormatArg(errorStr(std::forward<Args>(args)...));
 }
 
 template <bool emptyOk>
@@ -252,4 +277,3 @@ inline int FormatArg::splitIntKey() {
 }  // namespace folly
 
 #endif /* FOLLY_FORMATARG_H_ */
-

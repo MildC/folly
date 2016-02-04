@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,8 +27,9 @@
 #include <type_traits>
 #include <mutex>
 #include <boost/thread.hpp>
-#include "folly/Preprocessor.h"
-#include "folly/Traits.h"
+#include <folly/Preprocessor.h>
+#include <folly/SharedMutex.h>
+#include <folly/Traits.h>
 
 namespace folly {
 
@@ -39,6 +40,14 @@ enum InternalDoNotUse {};
  * Free function adaptors for std:: and boost::
  */
 
+// Android, OSX, and Cygwin don't have timed mutexes
+#if defined(ANDROID) || defined(__ANDROID__) || \
+    defined(__APPLE__) || defined(__CYGWIN__)
+# define FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES 0
+#else
+# define FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES 1
+#endif
+
 /**
  * Yields true iff T has .lock() and .unlock() member functions. This
  * is done by simply enumerating the mutexes with this interface in
@@ -46,44 +55,53 @@ enum InternalDoNotUse {};
  */
 template <class T>
 struct HasLockUnlock {
-  enum { value = IsOneOf<T,
-         std::mutex, std::recursive_mutex,
-         std::timed_mutex, std::recursive_timed_mutex,
-         boost::mutex, boost::recursive_mutex, boost::shared_mutex,
-         boost::timed_mutex, boost::recursive_timed_mutex
-         >::value };
+  enum { value = IsOneOf<T
+      , std::mutex
+      , std::recursive_mutex
+      , boost::mutex
+      , boost::recursive_mutex
+      , boost::shared_mutex
+#if FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+      , std::timed_mutex
+      , std::recursive_timed_mutex
+      , boost::timed_mutex
+      , boost::recursive_timed_mutex
+#endif
+      >::value };
 };
 
 /**
- * Acquires a mutex for reading by calling .lock(). The exception is
- * boost::shared_mutex, which has a special read-lock primitive called
- * .lock_shared().
+ * Yields true iff T has .lock_shared() and .unlock_shared() member functions.
+ * This is done by simply enumerating the mutexes with this interface.
+ */
+template <class T>
+struct HasLockSharedUnlockShared {
+  enum { value = IsOneOf<T
+      , boost::shared_mutex
+      >::value };
+};
+
+/**
+ * Acquires a mutex for reading by calling .lock().
+ *
+ * This variant is not appropriate for shared mutexes.
  */
 template <class T>
 typename std::enable_if<
-  HasLockUnlock<T>::value && !std::is_same<T, boost::shared_mutex>::value>::type
+  HasLockUnlock<T>::value && !HasLockSharedUnlockShared<T>::value>::type
 acquireRead(T& mutex) {
   mutex.lock();
 }
 
 /**
- * Special case for boost::shared_mutex.
+ * Acquires a mutex for reading by calling .lock_shared().
+ *
+ * This variant is not appropriate for nonshared mutexes.
  */
 template <class T>
-typename std::enable_if<std::is_same<T, boost::shared_mutex>::value>::type
+typename std::enable_if<HasLockSharedUnlockShared<T>::value>::type
 acquireRead(T& mutex) {
   mutex.lock_shared();
-}
-
-/**
- * Acquires a mutex for reading with timeout by calling .timed_lock(). This
- * applies to three of the boost mutex classes as enumerated below.
- */
-template <class T>
-typename std::enable_if<std::is_same<T, boost::shared_mutex>::value, bool>::type
-acquireRead(T& mutex,
-            unsigned int milliseconds) {
-  return mutex.timed_lock_shared(boost::posix_time::milliseconds(milliseconds));
 }
 
 /**
@@ -95,6 +113,21 @@ acquireReadWrite(T& mutex) {
   mutex.lock();
 }
 
+#if FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+/**
+ * Acquires a mutex for reading by calling .try_lock_shared_for(). This applies
+ * to boost::shared_mutex.
+ */
+template <class T>
+typename std::enable_if<
+  IsOneOf<T
+      , boost::shared_mutex
+      >::value, bool>::type
+acquireRead(T& mutex,
+            unsigned int milliseconds) {
+  return mutex.try_lock_shared_for(boost::chrono::milliseconds(milliseconds));
+}
+
 /**
  * Acquires a mutex for reading and writing with timeout by calling
  * .try_lock_for(). This applies to two of the std mutex classes as
@@ -102,25 +135,38 @@ acquireReadWrite(T& mutex) {
  */
 template <class T>
 typename std::enable_if<
-  IsOneOf<T, std::timed_mutex, std::recursive_timed_mutex>::value, bool>::type
+  IsOneOf<T
+      , std::timed_mutex
+      , std::recursive_timed_mutex
+      >::value, bool>::type
 acquireReadWrite(T& mutex,
                  unsigned int milliseconds) {
-  return mutex.try_lock_for(std::chrono::milliseconds(milliseconds));
+  // work around try_lock_for bug in some gcc versions, see
+  // http://gcc.gnu.org/bugzilla/show_bug.cgi?id=54562
+  // TODO: Fixed in gcc-4.9.0.
+  return mutex.try_lock()
+      || (milliseconds > 0 &&
+          mutex.try_lock_until(std::chrono::system_clock::now() +
+                               std::chrono::milliseconds(milliseconds)));
 }
 
 /**
  * Acquires a mutex for reading and writing with timeout by calling
- * .timed_lock(). This applies to three of the boost mutex classes as
+ * .try_lock_for(). This applies to three of the boost mutex classes as
  * enumerated below.
  */
 template <class T>
 typename std::enable_if<
-  IsOneOf<T, boost::shared_mutex, boost::timed_mutex,
-          boost::recursive_timed_mutex>::value, bool>::type
+  IsOneOf<T
+      , boost::shared_mutex
+      , boost::timed_mutex
+      , boost::recursive_timed_mutex
+      >::value, bool>::type
 acquireReadWrite(T& mutex,
                  unsigned int milliseconds) {
-  return mutex.timed_lock(boost::posix_time::milliseconds(milliseconds));
+  return mutex.try_lock_for(boost::chrono::milliseconds(milliseconds));
 }
+#endif // FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
 
 /**
  * Releases a mutex previously acquired for reading by calling
@@ -129,7 +175,7 @@ acquireReadWrite(T& mutex,
  */
 template <class T>
 typename std::enable_if<
-  HasLockUnlock<T>::value && !std::is_same<T, boost::shared_mutex>::value>::type
+  HasLockUnlock<T>::value && !HasLockSharedUnlockShared<T>::value>::type
 releaseRead(T& mutex) {
   mutex.unlock();
 }
@@ -138,7 +184,7 @@ releaseRead(T& mutex) {
  * Special case for boost::shared_mutex.
  */
 template <class T>
-typename std::enable_if<std::is_same<T, boost::shared_mutex>::value>::type
+typename std::enable_if<HasLockSharedUnlockShared<T>::value>::type
 releaseRead(T& mutex) {
   mutex.unlock_shared();
 }
@@ -179,7 +225,7 @@ releaseReadWrite(T& mutex) {
  * refer to the namespace detail below, which implements the
  * primitives for mutexes in std and boost.
  */
-template <class T, class Mutex = boost::shared_mutex>
+template <class T, class Mutex = SharedMutex>
 struct Synchronized {
   /**
    * Default constructor leaves both members call their own default
@@ -187,36 +233,63 @@ struct Synchronized {
    */
   Synchronized() = default;
 
+ private:
+  static constexpr bool nxCopyCtor{
+      std::is_nothrow_copy_constructible<T>::value};
+  static constexpr bool nxMoveCtor{
+      std::is_nothrow_move_constructible<T>::value};
+
+  /**
+   * Helper constructors to enable Synchronized for
+   * non-default constructible types T.
+   * Guards are created in actual public constructors and are alive
+   * for the time required to construct the object
+   */
+  template <typename Guard>
+  Synchronized(const Synchronized& rhs,
+               const Guard& /*guard*/) noexcept(nxCopyCtor)
+      : datum_(rhs.datum_) {}
+
+  template <typename Guard>
+  Synchronized(Synchronized&& rhs, const Guard& /*guard*/) noexcept(nxMoveCtor)
+      : datum_(std::move(rhs.datum_)) {}
+
+ public:
   /**
    * Copy constructor copies the data (with locking the source and
    * all) but does NOT copy the mutex. Doing so would result in
    * deadlocks.
    */
-  Synchronized(const Synchronized& rhs) {
-    auto guard = rhs.operator->();
-    datum_ = rhs.datum_;
-  }
+  Synchronized(const Synchronized& rhs) noexcept(nxCopyCtor)
+      : Synchronized(rhs, rhs.operator->()) {}
 
   /**
    * Move constructor moves the data (with locking the source and all)
    * but does not move the mutex.
    */
-  Synchronized(Synchronized&& rhs) {
-    auto guard = rhs.operator->();
-    datum_ = std::move(rhs.datum_);
-  }
+  Synchronized(Synchronized&& rhs) noexcept(nxMoveCtor)
+      : Synchronized(std::move(rhs), rhs.operator->()) {}
 
   /**
    * Constructor taking a datum as argument copies it. There is no
    * need to lock the constructing object.
    */
-  explicit Synchronized(const T& rhs) : datum_(rhs) {}
+  explicit Synchronized(const T& rhs) noexcept(nxCopyCtor) : datum_(rhs) {}
 
   /**
    * Constructor taking a datum rvalue as argument moves it. Again,
    * there is no need to lock the constructing object.
    */
-  explicit Synchronized(T && rhs) : datum_(std::move(rhs)) {}
+  explicit Synchronized(T&& rhs) noexcept(nxMoveCtor)
+      : datum_(std::move(rhs)) {}
+
+  /**
+   * Lets you construct non-movable types in-place. Use the constexpr
+   * instance `construct_in_place` as the first argument.
+   */
+  template <typename... Args>
+  explicit Synchronized(construct_in_place_t, Args&&... args)
+      : datum_(std::forward<Args>(args)...) {}
 
   /**
    * The canonical assignment operator only assigns the data, NOT the
@@ -224,7 +297,9 @@ struct Synchronized {
    * addresses.
    */
   Synchronized& operator=(const Synchronized& rhs) {
-    if (this < *rhs) {
+    if (this == &rhs) {
+      // Self-assignment, pass.
+    } else if (this < &rhs) {
       auto guard1 = operator->();
       auto guard2 = rhs.operator->();
       datum_ = rhs.datum_;
@@ -237,11 +312,40 @@ struct Synchronized {
   }
 
   /**
+   * Move assignment operator, only assigns the data, NOT the
+   * mutex. It locks the two objects in ascending order of their
+   * addresses.
+   */
+  Synchronized& operator=(Synchronized&& rhs) {
+    if (this == &rhs) {
+      // Self-assignment, pass.
+    } else if (this < &rhs) {
+      auto guard1 = operator->();
+      auto guard2 = rhs.operator->();
+      datum_ = std::move(rhs.datum_);
+    } else {
+      auto guard1 = rhs.operator->();
+      auto guard2 = operator->();
+      datum_ = std::move(rhs.datum_);
+    }
+    return *this;
+  }
+
+  /**
    * Lock object, assign datum.
    */
   Synchronized& operator=(const T& rhs) {
     auto guard = operator->();
     datum_ = rhs;
+    return *this;
+  }
+
+  /**
+   * Lock object, move-assign datum.
+   */
+  Synchronized& operator=(T&& rhs) {
+    auto guard = operator->();
+    datum_ = std::move(rhs);
     return *this;
   }
 
@@ -275,7 +379,7 @@ struct Synchronized {
         return;
       }
       // Could not acquire the resource, pointer is null
-      parent_ = NULL;
+      parent_ = nullptr;
     }
 
     /**
@@ -323,7 +427,7 @@ struct Synchronized {
      * SYNCHRONIZED below.
      */
     T* operator->() {
-      return parent_ ? &parent_->datum_ : NULL;
+      return parent_ ? &parent_->datum_ : nullptr;
     }
 
     /**
@@ -387,13 +491,15 @@ struct Synchronized {
       acquire();
     }
     ConstLockedPtr(const Synchronized* parent, unsigned int milliseconds) {
-      if (parent->mutex_.timed_lock(
-            boost::posix_time::milliseconds(milliseconds))) {
+      using namespace detail;
+      if (acquireRead(
+            parent->mutex_,
+            milliseconds)) {
         parent_ = parent;
         return;
       }
       // Could not acquire the resource, pointer is null
-      parent_ = NULL;
+      parent_ = nullptr;
     }
 
     ConstLockedPtr& operator=(const ConstLockedPtr& rhs) {
@@ -409,7 +515,7 @@ struct Synchronized {
     }
 
     const T* operator->() const {
-      return parent_ ? &parent_->datum_ : NULL;
+      return parent_ ? &parent_->datum_ : nullptr;
     }
 
     struct Unsynchronizer {
@@ -515,7 +621,9 @@ struct Synchronized {
     }
     auto guard1 = operator->();
     auto guard2 = rhs.operator->();
-    datum_.swap(rhs.datum_);
+
+    using std::swap;
+    swap(datum_, rhs.datum_);
   }
 
   /**
@@ -524,7 +632,9 @@ struct Synchronized {
    */
   void swap(T& rhs) {
     LockedPtr guard = operator->();
-    datum_.swap(rhs);
+
+    using std::swap;
+    swap(datum_, rhs);
   }
 
   /**
@@ -572,13 +682,16 @@ void swap(Synchronized<T, M>& lhs, Synchronized<T, M>& rhs) {
  * examples.
  */
 #define SYNCHRONIZED(...)                                       \
+  FOLLY_PUSH_WARNING                                            \
+  FOLLY_GCC_DISABLE_WARNING(shadow)                             \
   if (bool SYNCHRONIZED_state = false) {} else                  \
     for (auto SYNCHRONIZED_lockedPtr =                          \
            (FB_ARG_2_OR_1(__VA_ARGS__)).operator->();           \
          !SYNCHRONIZED_state; SYNCHRONIZED_state = true)        \
       for (auto& FB_ARG_1(__VA_ARGS__) =                        \
              *SYNCHRONIZED_lockedPtr.operator->();              \
-           !SYNCHRONIZED_state; SYNCHRONIZED_state = true)
+           !SYNCHRONIZED_state; SYNCHRONIZED_state = true)      \
+  FOLLY_POP_WARNING
 
 #define TIMED_SYNCHRONIZED(timeout, ...)                           \
   if (bool SYNCHRONIZED_state = false) {} else                     \
@@ -610,7 +723,7 @@ void swap(Synchronized<T, M>& lhs, Synchronized<T, M>& rhs) {
   for (decltype(SYNCHRONIZED_lockedPtr.typeHackDoNotUse())      \
          SYNCHRONIZED_state3(&SYNCHRONIZED_lockedPtr);          \
        !SYNCHRONIZED_state; SYNCHRONIZED_state = true)          \
-    for (auto name = *SYNCHRONIZED_state3.operator->();         \
+    for (auto& name = *SYNCHRONIZED_state3.operator->();        \
          !SYNCHRONIZED_state; SYNCHRONIZED_state = true)
 
 /**

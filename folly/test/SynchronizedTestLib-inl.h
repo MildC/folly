@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,19 +25,21 @@
 #include <thread>
 #include <vector>
 #include <glog/logging.h>
-#include "folly/Foreach.h"
-#include "folly/Random.h"
-#include "folly/Synchronized.h"
+#include <folly/Foreach.h>
+#include <folly/Random.h>
+#include <folly/Synchronized.h>
 
 
-static const auto seed = folly::randomNumberSeed();
-typedef std::mt19937 RandomT;
-static RandomT rng(seed);
+inline std::mt19937& getRNG() {
+  static const auto seed = folly::randomNumberSeed();
+  static std::mt19937 rng(seed);
+  return rng;
+}
 
 template <class Integral1, class Integral2>
 Integral2 random(Integral1 low, Integral2 up) {
   std::uniform_int_distribution<> range(low, up);
-  return range(rng);
+  return range(getRNG());
 }
 
 template <class Mutex>
@@ -186,12 +188,12 @@ template <class Mutex> void testDualLockingWithConst() {
 
       if (i & 1) {
         SYNCHRONIZED_DUAL (v, pv, m, pm) {
-          size_t s = m.size();
+          (void)m.size();
           v.push_back(i);
         }
       } else {
         SYNCHRONIZED_DUAL (m, pm, v, pv) {
-          size_t s = m.size();
+          (void)m.size();
           v.push_back(i);
         }
       }
@@ -274,6 +276,56 @@ template <class Mutex> void testTimedSynchronized() {
   }
 }
 
+template <class Mutex> void testTimedSynchronizedWithConst() {
+  folly::Synchronized<std::vector<int>, Mutex> v;
+
+  struct Local {
+    static bool threadMain(int i,
+                           folly::Synchronized<std::vector<int>, Mutex>& pv) {
+      usleep(::random(100 * 1000, 1000 * 1000));
+
+      // Test operator->
+      pv->push_back(i);
+
+      usleep(::random(5 * 1000, 1000 * 1000));
+      // Test TIMED_SYNCHRONIZED_CONST
+      for (;;) {
+        TIMED_SYNCHRONIZED_CONST (10, v, pv) {
+          if (v) {
+            auto found = std::find(v->begin(), v->end(),  i);
+            CHECK(found != v->end());
+            return true;
+          } else {
+            // do nothing
+            usleep(::random(10 * 1000, 100 * 1000));
+          }
+        }
+      }
+    }
+  };
+
+  std::vector<std::thread> results;
+
+  static const size_t threads = 100;
+  FOR_EACH_RANGE (i, 0, threads) {
+    results.push_back(std::thread([&, i]() { Local::threadMain(i, v); }));
+  }
+
+  FOR_EACH (i, results) {
+    i->join();
+  }
+
+  std::vector<int> result;
+  v.swap(result);
+
+  EXPECT_EQ(result.size(), threads);
+  sort(result.begin(), result.end());
+
+  FOR_EACH_RANGE (i, 0, threads) {
+    EXPECT_EQ(result[i], i);
+  }
+}
+
 template <class Mutex> void testConstCopy() {
   std::vector<int> input = {1, 2, 3};
   const folly::Synchronized<std::vector<int>, Mutex> v(input);
@@ -285,6 +337,21 @@ template <class Mutex> void testConstCopy() {
 
   result = v.copy();
   EXPECT_EQ(result, input);
+}
+
+struct NotCopiableNotMovable {
+  NotCopiableNotMovable(int, const char*) {}
+  NotCopiableNotMovable(const NotCopiableNotMovable&) = delete;
+  NotCopiableNotMovable& operator=(const NotCopiableNotMovable&) = delete;
+  NotCopiableNotMovable(NotCopiableNotMovable&&) = delete;
+  NotCopiableNotMovable& operator=(NotCopiableNotMovable&&) = delete;
+};
+
+template <class Mutex> void testInPlaceConstruction() {
+  // This won't compile without construct_in_place
+  folly::Synchronized<NotCopiableNotMovable> a(
+    folly::construct_in_place, 5, "a"
+  );
 }
 
 

@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,27 @@
 #error This file may only be included from Format.h.
 #endif
 
+#include <array>
+#include <cinttypes>
+#include <deque>
+#include <map>
+#include <unordered_map>
+#include <vector>
+
+#include <folly/Exception.h>
+#include <folly/FormatTraits.h>
+#include <folly/Traits.h>
+
+// Ignore -Wformat-nonliteral warnings within this file
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wformat-nonliteral"
+
 namespace folly {
 
 namespace detail {
+
+// Updates the end of the buffer after the comma separators have been added.
+void insertThousandsGroupingUnsafe(char* start_buffer, char** end_buffer);
 
 extern const char formatHexUpper[256][2];
 extern const char formatHexLower[256][2];
@@ -43,7 +61,9 @@ const size_t kMaxBinaryLength = 8 * sizeof(uintmax_t);
 template <class Uint>
 size_t uintToHex(char* buffer, size_t bufLen, Uint v,
                  const char (&repr)[256][2]) {
-  for (; v >= 256; v >>= 8) {
+  // 'v >>= 7, v >>= 1' is no more than a work around to get rid of shift size
+  // warning when Uint = uint8_t (it's false as v >= 256 implies sizeof(v) > 1).
+  for (; !less_than<unsigned, 256>(v); v >>= 7, v >>= 1) {
     auto b = v & 0xff;
     bufLen -= 2;
     buffer[bufLen] = repr[b][0];
@@ -85,7 +105,9 @@ inline size_t uintToHexUpper(char* buffer, size_t bufLen, Uint v) {
 template <class Uint>
 size_t uintToOctal(char* buffer, size_t bufLen, Uint v) {
   auto& repr = formatOctal;
-  for (; v >= 512; v >>= 9) {
+  // 'v >>= 7, v >>= 2' is no more than a work around to get rid of shift size
+  // warning when Uint = uint8_t (it's false as v >= 512 implies sizeof(v) > 1).
+  for (; !less_than<unsigned, 512>(v); v >>= 7, v >>= 2) {
     auto b = v & 0x1ff;
     bufLen -= 3;
     buffer[bufLen] = repr[b][0];
@@ -117,7 +139,7 @@ size_t uintToBinary(char* buffer, size_t bufLen, Uint v) {
     buffer[--bufLen] = '0';
     return bufLen;
   }
-  for (; v; v >>= 8) {
+  for (; v; v >>= 7, v >>= 1) {
     auto b = v & 0xff;
     bufLen -= 8;
     memcpy(buffer + bufLen, &(repr[b][0]), 8);
@@ -130,22 +152,20 @@ size_t uintToBinary(char* buffer, size_t bufLen, Uint v) {
 
 }  // namespace detail
 
-
-template <bool containerMode, class... Args>
-Formatter<containerMode, Args...>::Formatter(StringPiece str, Args&&... args)
-  : str_(str),
-    values_(FormatValue<typename std::decay<Args>::type>(
-        std::forward<Args>(args))...) {
+template <class Derived, bool containerMode, class... Args>
+BaseFormatter<Derived, containerMode, Args...>::BaseFormatter(StringPiece str,
+                                                              Args&&... args)
+    : str_(str),
+      values_(FormatValue<typename std::decay<Args>::type>(
+          std::forward<Args>(args))...) {
   static_assert(!containerMode || sizeof...(Args) == 1,
                 "Exactly one argument required in container mode");
 }
 
-template <bool containerMode, class... Args>
+template <class Derived, bool containerMode, class... Args>
 template <class Output>
-void Formatter<containerMode, Args...>::operator()(Output& out) const {
-  auto p = str_.begin();
-  auto end = str_.end();
-
+void BaseFormatter<Derived, containerMode, Args...>::operator()(Output& out)
+    const {
   // Copy raw string (without format specifiers) to output;
   // not as simple as we'd like, as we still need to translate "}}" to "}"
   // and throw if we see any lone "}"
@@ -163,12 +183,14 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
       p = q;
 
       if (p == end || *p != '}') {
-        throw std::invalid_argument(
-            "folly::format: single '}' in format string");
+        throw BadFormatArg("folly::format: single '}' in format string");
       }
       ++p;
     }
   };
+
+  auto p = str_.begin();
+  auto end = str_.end();
 
   int nextArg = 0;
   bool hasDefaultArgIndex = false;
@@ -183,8 +205,7 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
     p = q + 1;
 
     if (p == end) {
-      throw std::invalid_argument(
-          "folly::format: '}' at end of format string");
+      throw BadFormatArg("folly::format: '}' at end of format string");
     }
 
     // "{{" -> "{"
@@ -196,8 +217,8 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
 
     // Format string
     q = static_cast<const char*>(memchr(p, '}', end - p));
-    if (q == end) {
-      throw std::invalid_argument("folly::format: missing ending '}'");
+    if (q == nullptr) {
+      throw BadFormatArg("folly::format: missing ending '}'");
     }
     FormatArg arg(StringPiece(p, q));
     p = q + 1;
@@ -205,6 +226,8 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
     int argIndex = 0;
     auto piece = arg.splitKey<true>();  // empty key component is okay
     if (containerMode) {  // static
+      arg.enforce(arg.width != FormatArg::kDynamicWidth,
+                  "dynamic field width not supported in vformat()");
       if (piece.empty()) {
         arg.setNextIntKey(nextArg++);
         hasDefaultArgIndex = true;
@@ -214,9 +237,22 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
       }
     } else {
       if (piece.empty()) {
+        if (arg.width == FormatArg::kDynamicWidth) {
+          arg.enforce(arg.widthIndex == FormatArg::kNoIndex,
+                      "cannot provide width arg index without value arg index");
+          int sizeArg = nextArg++;
+          arg.width = getSizeArg(sizeArg, arg);
+        }
+
         argIndex = nextArg++;
         hasDefaultArgIndex = true;
       } else {
+        if (arg.width == FormatArg::kDynamicWidth) {
+          arg.enforce(arg.widthIndex != FormatArg::kNoIndex,
+                      "cannot provide value arg index without width arg index");
+          arg.width = getSizeArg(arg.widthIndex, arg);
+        }
+
         try {
           argIndex = to<int>(piece);
         } catch (const std::out_of_range& e) {
@@ -228,7 +264,7 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
     }
 
     if (hasDefaultArgIndex && hasExplicitArgIndex) {
-      throw std::invalid_argument(
+      throw BadFormatArg(
           "folly::format: may not have both default and explicit arg indexes");
     }
 
@@ -236,12 +272,35 @@ void Formatter<containerMode, Args...>::operator()(Output& out) const {
   }
 }
 
+template <class Derived, bool containerMode, class... Args>
+void writeTo(FILE* fp,
+             const BaseFormatter<Derived, containerMode, Args...>& formatter) {
+  auto writer = [fp] (StringPiece sp) {
+    size_t n = fwrite(sp.data(), 1, sp.size(), fp);
+    if (n < sp.size()) {
+      throwSystemError("Formatter writeTo", "fwrite failed");
+    }
+  };
+  formatter(writer);
+}
+
 namespace format_value {
 
 template <class FormatCallback>
 void formatString(StringPiece val, FormatArg& arg, FormatCallback& cb) {
+  if (arg.width != FormatArg::kDefaultWidth && arg.width < 0) {
+    throw BadFormatArg("folly::format: invalid width");
+  }
+  if (arg.precision != FormatArg::kDefaultPrecision && arg.precision < 0) {
+    throw BadFormatArg("folly::format: invalid precision");
+  }
+
+  // XXX: clang should be smart enough to not need the two static_cast<size_t>
+  // uses below given the above checks. If clang ever becomes that smart, we
+  // should remove the otherwise unnecessary warts.
+
   if (arg.precision != FormatArg::kDefaultPrecision &&
-      val.size() > arg.precision) {
+      val.size() > static_cast<size_t>(arg.precision)) {
     val.reset(val.data(), arg.precision);
   }
 
@@ -258,9 +317,10 @@ void formatString(StringPiece val, FormatArg& arg, FormatCallback& cb) {
   };
 
   int padRemaining = 0;
-  if (arg.width != FormatArg::kDefaultWidth && val.size() < arg.width) {
+  if (arg.width != FormatArg::kDefaultWidth &&
+      val.size() < static_cast<size_t>(arg.width)) {
     char fill = arg.fill == FormatArg::kDefaultFill ? ' ' : arg.fill;
-    int padChars = arg.width - val.size();
+    int padChars = static_cast<int> (arg.width - val.size());
     memset(padBuf, fill, std::min(padBufSize, padChars));
 
     switch (arg.align) {
@@ -305,10 +365,14 @@ void formatNumber(StringPiece val, int prefixLen, FormatArg& arg,
   format_value::formatString(val, arg, cb);
 }
 
-template <class FormatCallback, bool containerMode, class... Args>
-void formatFormatter(const Formatter<containerMode, Args...>& formatter,
-                     FormatArg& arg,
-                     FormatCallback& cb) {
+template <class FormatCallback,
+          class Derived,
+          bool containerMode,
+          class... Args>
+void formatFormatter(
+    const BaseFormatter<Derived, containerMode, Args...>& formatter,
+    FormatArg& arg,
+    FormatCallback& cb) {
   if (arg.width == FormatArg::kDefaultWidth &&
       arg.precision == FormatArg::kDefaultPrecision) {
     // nothing to do
@@ -354,6 +418,11 @@ class FormatValue<
   {
  public:
   explicit FormatValue(T val) : val_(val) { }
+
+  T getValue() const {
+    return val_;
+  }
+
   template <class FormatCallback>
   void format(FormatArg& arg, FormatCallback& cb) const {
     arg.validate(FormatArg::Type::INTEGER);
@@ -373,7 +442,7 @@ class FormatValue<
     UT uval;
     char sign;
     if (std::is_signed<T>::value) {
-      if (val_ < 0) {
+      if (folly::is_negative(val_)) {
         uval = static_cast<UT>(-val_);
         sign = '-';
       } else {
@@ -410,28 +479,52 @@ class FormatValue<
     char* valBufBegin = nullptr;
     char* valBufEnd = nullptr;
 
-    // Defer to sprintf
-    auto useSprintf = [&] (const char* format) mutable {
-      valBufBegin = valBuf + 3;  // room for sign and base prefix
-      valBufEnd = valBufBegin + sprintf(valBufBegin, format,
-                                        static_cast<uintmax_t>(uval));
-    };
-
     int prefixLen = 0;
-
     switch (presentation) {
-    case 'n':  // TODO(tudorb): locale awareness?
+    case 'n': {
+      arg.enforce(!arg.basePrefix,
+                  "base prefix not allowed with '", presentation,
+                  "' specifier");
+
+      arg.enforce(!arg.thousandsSeparator,
+                  "cannot use ',' with the '", presentation,
+                  "' specifier");
+
+      valBufBegin = valBuf + 3;  // room for sign and base prefix
+#ifdef _MSC_VER
+      char valBuf2[valBufSize];
+      snprintf(valBuf2, valBufSize, "%ju", static_cast<uintmax_t>(uval));
+      int len = GetNumberFormat(
+        LOCALE_USER_DEFAULT,
+        0,
+        valBuf2,
+        nullptr,
+        valBufBegin,
+        (int)((valBuf + valBufSize) - valBufBegin)
+      );
+#elif defined(__ANDROID__)
+      int len = snprintf(valBufBegin, (valBuf + valBufSize) - valBufBegin,
+                         "%" PRIuMAX, static_cast<uintmax_t>(uval));
+#else
+      int len = snprintf(valBufBegin, (valBuf + valBufSize) - valBufBegin,
+                         "%'ju", static_cast<uintmax_t>(uval));
+#endif
+      // valBufSize should always be big enough, so this should never
+      // happen.
+      assert(len < valBuf + valBufSize - valBufBegin);
+      valBufEnd = valBufBegin + len;
+      break;
+    }
     case 'd':
       arg.enforce(!arg.basePrefix,
                   "base prefix not allowed with '", presentation,
                   "' specifier");
+      valBufBegin = valBuf + 3;  // room for sign and base prefix
+
+      // Use uintToBuffer, faster than sprintf
+      valBufEnd = valBufBegin + uint64ToBufferUnsafe(uval, valBufBegin);
       if (arg.thousandsSeparator) {
-        useSprintf("%'ju");
-      } else {
-        // Use uintToBuffer, faster than sprintf
-        valBufEnd = valBuf + valBufSize - 1;
-        valBufBegin = valBuf + detail::uintToBuffer(valBuf, valBufSize - 1,
-                                                    uval);
+        detail::insertThousandsGroupingUnsafe(valBufBegin, &valBufEnd);
       }
       break;
     case 'c':
@@ -542,129 +635,15 @@ class FormatValue<double> {
 
   template <class FormatCallback>
   void format(FormatArg& arg, FormatCallback& cb) const {
-    using ::double_conversion::DoubleToStringConverter;
-    using ::double_conversion::StringBuilder;
-
-    arg.validate(FormatArg::Type::FLOAT);
-
-    if (arg.presentation == FormatArg::kDefaultPresentation) {
-      arg.presentation = 'g';
-    }
-
-    const char* infinitySymbol = isupper(arg.presentation) ? "INF" : "inf";
-    const char* nanSymbol = isupper(arg.presentation) ? "NAN" : "nan";
-    char exponentSymbol = isupper(arg.presentation) ? 'E' : 'e';
-
-    if (arg.precision == FormatArg::kDefaultPrecision) {
-      arg.precision = 6;
-    }
-
-    bool done = false;
-
-    // 2+: for null terminator and optional sign shenanigans.
-    char buf[2 + std::max({
-        (2 + DoubleToStringConverter::kMaxFixedDigitsBeforePoint +
-         DoubleToStringConverter::kMaxFixedDigitsAfterPoint),
-        (8 + DoubleToStringConverter::kMaxExponentialDigits),
-        (7 + DoubleToStringConverter::kMaxPrecisionDigits)})];
-    StringBuilder builder(buf + 1, sizeof(buf) - 1);
-
-    char plusSign;
-    switch (arg.sign) {
-    case FormatArg::Sign::PLUS_OR_MINUS:
-      plusSign = '+';
-      break;
-    case FormatArg::Sign::SPACE_OR_MINUS:
-      plusSign = ' ';
-      break;
-    default:
-      plusSign = '\0';
-      break;
-    };
-
-    double val = val_;
-    switch (arg.presentation) {
-    case '%':
-      val *= 100;
-    case 'f':
-    case 'F':
-      {
-        if (arg.precision >
-            DoubleToStringConverter::kMaxFixedDigitsAfterPoint) {
-          arg.precision = DoubleToStringConverter::kMaxFixedDigitsAfterPoint;
-        }
-        DoubleToStringConverter conv(
-            DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN,
-            infinitySymbol,
-            nanSymbol,
-            exponentSymbol,
-            -4, arg.precision,
-            0, 0);
-        arg.enforce(conv.ToFixed(val, arg.precision, &builder),
-                    "fixed double conversion failed");
-      }
-      break;
-    case 'e':
-    case 'E':
-      {
-        if (arg.precision > DoubleToStringConverter::kMaxExponentialDigits) {
-          arg.precision = DoubleToStringConverter::kMaxExponentialDigits;
-        }
-
-        DoubleToStringConverter conv(
-            DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN,
-            infinitySymbol,
-            nanSymbol,
-            exponentSymbol,
-            -4, arg.precision,
-            0, 0);
-        CHECK(conv.ToExponential(val, arg.precision, &builder));
-      }
-      break;
-    case 'n':  // should be locale-aware, but isn't
-    case 'g':
-    case 'G':
-      {
-        if (arg.precision < DoubleToStringConverter::kMinPrecisionDigits) {
-          arg.precision = DoubleToStringConverter::kMinPrecisionDigits;
-        } else if (arg.precision >
-                   DoubleToStringConverter::kMaxPrecisionDigits) {
-          arg.precision = DoubleToStringConverter::kMaxPrecisionDigits;
-        }
-        DoubleToStringConverter conv(
-            DoubleToStringConverter::EMIT_POSITIVE_EXPONENT_SIGN,
-            infinitySymbol,
-            nanSymbol,
-            exponentSymbol,
-            -4, arg.precision,
-            0, 0);
-        CHECK(conv.ToShortest(val, &builder));
-      }
-      break;
-    default:
-      arg.error("invalid specifier '", arg.presentation, "'");
-    }
-
-    int len = builder.position();
-    builder.Finalize();
-    DCHECK_GT(len, 0);
-
-    // Add '+' or ' ' sign if needed
-    char* p = buf + 1;
-    // anything that's neither negative nor nan
-    int prefixLen = 0;
-    if (plusSign && (*p != '-' && *p != 'n' && *p != 'N')) {
-      *--p = plusSign;
-      ++len;
-      prefixLen = 1;
-    } else if (*p == '-') {
-      prefixLen = 1;
-    }
-
-    format_value::formatNumber(StringPiece(p, len), prefixLen, arg, cb);
+    fbstring piece;
+    int prefixLen;
+    formatHelper(piece, prefixLen, arg);
+    format_value::formatNumber(piece, prefixLen, arg, cb);
   }
 
  private:
+  void formatHelper(fbstring& piece, int& prefixLen, FormatArg& arg) const;
+
   double val_;
 };
 
@@ -788,6 +767,30 @@ class FormatValue<
   T* val_;
 };
 
+template <class T, class = void>
+class TryFormatValue {
+ public:
+  template <class FormatCallback>
+  static void formatOrFail(T& /* value */,
+                           FormatArg& arg,
+                           FormatCallback& /* cb */) {
+    arg.error("No formatter available for this type");
+  }
+};
+
+template <class T>
+class TryFormatValue<
+  T,
+  typename std::enable_if<
+      0 < sizeof(FormatValue<typename std::decay<T>::type>)>::type>
+  {
+ public:
+  template <class FormatCallback>
+  static void formatOrFail(T& value, FormatArg& arg, FormatCallback& cb) {
+    FormatValue<typename std::decay<T>::type>(value).format(arg, cb);
+  }
+};
+
 // Partial specialization of FormatValue for other pointers
 template <class T>
 class FormatValue<
@@ -804,8 +807,7 @@ class FormatValue<
     if (arg.keyEmpty()) {
       FormatValue<void*>((void*)val_).format(arg, cb);
     } else {
-      FormatValue<typename std::decay<T>::type>(
-          val_[arg.splitIntKey()]).format(arg, cb);
+      TryFormatValue<T>::formatOrFail(val_[arg.splitIntKey()], arg, cb);
     }
   }
  private:
@@ -813,35 +815,6 @@ class FormatValue<
 };
 
 namespace detail {
-
-// Shortcut, so we don't have to use enable_if everywhere
-struct FormatTraitsBase {
-  typedef void enabled;
-};
-
-// Traits that define enabled, value_type, and at() for anything
-// indexable with integral keys: pointers, arrays, vectors, and maps
-// with integral keys
-template <class T, class Enable=void> struct IndexableTraits;
-
-// Base class for sequences (vectors, deques)
-template <class C>
-struct IndexableTraitsSeq : public FormatTraitsBase {
-  typedef C container_type;
-  typedef typename C::value_type value_type;
-  static const value_type& at(const C& c, int idx) {
-    return c.at(idx);
-  }
-};
-
-// Base class for associative types (maps)
-template <class C>
-struct IndexableTraitsAssoc : public FormatTraitsBase {
-  typedef typename C::value_type::second_type value_type;
-  static const value_type& at(const C& c, int idx) {
-    return c.at(static_cast<typename C::key_type>(idx));
-  }
-};
 
 // std::array
 template <class T, size_t N>
@@ -859,18 +832,6 @@ struct IndexableTraits<std::vector<T, A>>
 template <class T, class A>
 struct IndexableTraits<std::deque<T, A>>
   : public IndexableTraitsSeq<std::deque<T, A>> {
-};
-
-// fbvector
-template <class T, class A>
-struct IndexableTraits<fbvector<T, A>>
-  : public IndexableTraitsSeq<fbvector<T, A>> {
-};
-
-// small_vector
-template <class T, size_t M, class A, class B, class C>
-struct IndexableTraits<small_vector<T, M, A, B, C>>
-  : public IndexableTraitsSeq<small_vector<T, M, A, B, C>> {
 };
 
 // std::map with integral keys
@@ -909,6 +870,28 @@ class FormatValue<
 
  private:
   const T& val_;
+};
+
+template <class Container, class Value>
+class FormatValue<
+  detail::DefaultValueWrapper<Container, Value>,
+  typename detail::IndexableTraits<Container>::enabled> {
+ public:
+  explicit FormatValue(const detail::DefaultValueWrapper<Container, Value>& val)
+    : val_(val) { }
+
+  template <class FormatCallback>
+  void format(FormatArg& arg, FormatCallback& cb) const {
+    FormatValue<typename std::decay<
+      typename detail::IndexableTraits<Container>::value_type>::type>(
+          detail::IndexableTraits<Container>::at(
+              val_.container,
+              arg.splitIntKey(),
+              val_.defaultValue)).format(arg, cb);
+  }
+
+ private:
+  const detail::DefaultValueWrapper<Container, Value>& val_;
 };
 
 namespace detail {
@@ -951,6 +934,11 @@ template <class T> struct KeyableTraitsAssoc : public FormatTraitsBase {
   typedef typename T::value_type::second_type value_type;
   static const value_type& at(const T& map, StringPiece key) {
     return map.at(KeyFromStringPiece<key_type>::convert(key));
+  }
+  static const value_type& at(const T& map, StringPiece key,
+                              const value_type& dflt) {
+    auto pos = map.find(KeyFromStringPiece<key_type>::convert(key));
+    return pos != map.end() ? pos->second : dflt;
   }
 };
 
@@ -996,6 +984,28 @@ class FormatValue<
   const T& val_;
 };
 
+template <class Container, class Value>
+class FormatValue<
+  detail::DefaultValueWrapper<Container, Value>,
+  typename detail::KeyableTraits<Container>::enabled> {
+ public:
+  explicit FormatValue(const detail::DefaultValueWrapper<Container, Value>& val)
+    : val_(val) { }
+
+  template <class FormatCallback>
+  void format(FormatArg& arg, FormatCallback& cb) const {
+    FormatValue<typename std::decay<
+      typename detail::KeyableTraits<Container>::value_type>::type>(
+          detail::KeyableTraits<Container>::at(
+              val_.container,
+              arg.splitKey(),
+              val_.defaultValue)).format(arg, cb);
+  }
+
+ private:
+  const detail::DefaultValueWrapper<Container, Value>& val_;
+};
+
 // Partial specialization of FormatValue for pairs
 template <class A, class B>
 class FormatValue<std::pair<A, B>> {
@@ -1039,8 +1049,8 @@ class FormatValue<std::tuple<Args...>> {
   static constexpr size_t valueCount = std::tuple_size<Tuple>::value;
 
   template <size_t K, class Callback>
-  typename std::enable_if<K == valueCount>::type
-  doFormatFrom(size_t i, FormatArg& arg, Callback& cb) const {
+  typename std::enable_if<K == valueCount>::type doFormatFrom(
+      size_t i, FormatArg& arg, Callback& /* cb */) const {
     arg.enforce("tuple index out of range, max=", i);
   }
 
@@ -1064,15 +1074,35 @@ class FormatValue<std::tuple<Args...>> {
   const Tuple& val_;
 };
 
+// Partial specialization of FormatValue for nested Formatters
+template <bool containerMode, class... Args,
+          template <bool, class...> class F>
+class FormatValue<F<containerMode, Args...>,
+                  typename std::enable_if<detail::IsFormatter<
+                      F<containerMode, Args...>>::value>::type> {
+  typedef typename F<containerMode, Args...>::BaseType FormatterValue;
+
+ public:
+  explicit FormatValue(const FormatterValue& f) : f_(f) { }
+
+  template <class FormatCallback>
+  void format(FormatArg& arg, FormatCallback& cb) const {
+    format_value::formatFormatter(f_, arg, cb);
+  }
+ private:
+  const FormatterValue& f_;
+};
+
 /**
  * Formatter objects can be appended to strings, and therefore they're
  * compatible with folly::toAppend and folly::to.
  */
-template <class Tgt, bool containerMode, class... Args>
-typename std::enable_if<
-   detail::IsSomeString<Tgt>::value>::type
-toAppend(const Formatter<containerMode, Args...>& value, Tgt * result) {
+template <class Tgt, class Derived, bool containerMode, class... Args>
+typename std::enable_if<IsSomeString<Tgt>::value>::type toAppend(
+    const BaseFormatter<Derived, containerMode, Args...>& value, Tgt* result) {
   value.appendTo(*result);
 }
 
 }  // namespace folly
+
+#pragma GCC diagnostic pop

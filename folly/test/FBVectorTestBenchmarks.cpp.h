@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,7 +47,8 @@ TESTFUN(clause_23_3_6_1_9) {
   EXPECT_EQ(v.size(), lst.size());
   size_t j = 0;
   FOR_EACH (i, lst) {
-    EXPECT_EQ(v[j++], *i);
+    EXPECT_EQ(v[j], *i);
+    j++;
   }
 }
 
@@ -63,7 +64,8 @@ TESTFUN(clause_23_3_6_1_11) {
   EXPECT_EQ(v.size(), lst.size());
   size_t j = 0;
   FOR_EACH (i, lst) {
-    EXPECT_EQ(v[j++], *i);
+    EXPECT_EQ(v[j], *i);
+    j++;
   }
 
   // aliased assign
@@ -72,7 +74,8 @@ TESTFUN(clause_23_3_6_1_11) {
   j = 0;
   FOR_EACH (i, lst) {
     if (j == v.size()) break;
-    EXPECT_EQ(v[j++], *i);
+    EXPECT_EQ(v[j], *i);
+    j++;
   }
 }
 
@@ -299,7 +302,7 @@ TESTFUN(clause_23_3_6_4_clear) {
   EXPECT_EQ(v.capacity(), c);
 }
 
-BENCHMARK(BENCHFUN(zzInitRNG), iters) {
+BENCHMARK(BENCHFUN(zzInitRNG)) {
   //LOG(INFO) << "\nTesting with type " << typeid(VECTOR).name() << "\n";
   srand(seed);
 }
@@ -346,7 +349,7 @@ BENCHMARK_PARAM(BENCHFUN(pushBack), 10240);
 BENCHMARK_PARAM(BENCHFUN(pushBack), 102400);
 BENCHMARK_PARAM(BENCHFUN(pushBack), 512000);
 
-void BENCHFUN(reserve)(int iters, int size) {
+void BENCHFUN(reserve)(int iters, int /* size */) {
   auto const obj = randomObject<VECTOR::value_type>();
   VECTOR v(random(0U, 10000U), obj);
   FOR_EACH_RANGE (i, 0, iters) {
@@ -357,7 +360,7 @@ BENCHMARK_PARAM(BENCHFUN(reserve), 128);
 BENCHMARK_PARAM(BENCHFUN(reserve), 1024);
 BENCHMARK_PARAM(BENCHFUN(reserve), 10240);
 
-void BENCHFUN(insert)(int iters, int size) {
+void BENCHFUN(insert)(int iters, int /* size */) {
   auto const obj1 = randomObject<VECTOR::value_type>();
   auto const obj2 = randomObject<VECTOR::value_type>();
   VECTOR v(random(0U, 1U), obj1);
@@ -367,7 +370,7 @@ void BENCHFUN(insert)(int iters, int size) {
 }
 BENCHMARK_PARAM(BENCHFUN(insert), 100);
 
-void BENCHFUN(erase)(int iters, int size) {
+void BENCHFUN(erase)(int iters, int /* size */) {
   auto const obj1 = randomObject<VECTOR::value_type>();
   VECTOR v(random(0U, 100U), obj1);
   FOR_EACH_RANGE (i, 0, iters) {
@@ -376,4 +379,3 @@ void BENCHFUN(erase)(int iters, int size) {
   }
 }
 BENCHMARK_PARAM(BENCHFUN(erase), 1024);
-

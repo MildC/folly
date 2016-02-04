@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,13 +21,12 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <vector>
+#include <thread>
 
-#include <boost/thread.hpp>
-
-#include "gtest/gtest.h"
+#include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include "folly/RWSpinLock.h"
+#include <folly/RWSpinLock.h>
 
 DEFINE_int32(num_threads, 8, "num threads");
 
@@ -42,8 +41,7 @@ template<typename RWSpinLockT> struct RWSpinLockTest: public testing::Test {
 };
 
 typedef testing::Types<RWSpinLock
-#if defined(__GNUC__) && (defined(__i386) || defined(__x86_64__) || \
-    defined(ARCH_K8))
+#ifdef RW_SPINLOCK_USE_X86_INTRINSIC_
         , RWTicketSpinLockT<32, true>,
         RWTicketSpinLockT<32, false>,
         RWTicketSpinLockT<64, true>,
@@ -66,7 +64,7 @@ static void run(RWSpinLockType* lock) {
       ++reads;
     }
   }
-  VLOG(0) << "total reads: " << reads << "; total writes: " << writes;
+  // VLOG(0) << "total reads: " << reads << "; total writes: " << writes;
 }
 
 
@@ -150,11 +148,11 @@ TYPED_TEST(RWSpinLockTest, Write_Holders) {
 TYPED_TEST(RWSpinLockTest, ConcurrentTests) {
   typedef typename TestFixture::RWSpinLockType RWSpinLockType;
   RWSpinLockType l;
-  srand(time(NULL));
+  srand(time(nullptr));
 
-  std::vector<boost::thread> threads;
+  std::vector<std::thread> threads;
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(boost::thread(&run<RWSpinLockType>, &l));
+    threads.push_back(std::thread(&run<RWSpinLockType>, &l));
   }
 
   sleep(1);
@@ -170,10 +168,11 @@ TYPED_TEST(RWSpinLockTest, ConcurrentTests) {
 TEST(RWSpinLock, lock_unlock_tests) {
   folly::RWSpinLock lock;
   EXPECT_TRUE(lock.try_lock_upgrade());
-  EXPECT_TRUE(lock.try_lock_shared());
+  EXPECT_FALSE(lock.try_lock_shared());
   EXPECT_FALSE(lock.try_lock());
   EXPECT_FALSE(lock.try_lock_upgrade());
   lock.unlock_upgrade();
+  lock.lock_shared();
   EXPECT_FALSE(lock.try_lock());
   EXPECT_TRUE(lock.try_lock_upgrade());
   lock.unlock_upgrade();
@@ -181,15 +180,14 @@ TEST(RWSpinLock, lock_unlock_tests) {
   EXPECT_TRUE(lock.try_lock());
   EXPECT_FALSE(lock.try_lock_upgrade());
   lock.unlock_and_lock_upgrade();
-  EXPECT_TRUE(lock.try_lock_shared());
-  lock.unlock_shared();
+  EXPECT_FALSE(lock.try_lock_shared());
   lock.unlock_upgrade_and_lock_shared();
   lock.unlock_shared();
   EXPECT_EQ(0, lock.bits());
 }
 
 TEST(RWSpinLock, concurrent_holder_test) {
-  srand(time(NULL));
+  srand(time(nullptr));
 
   folly::RWSpinLock lock;
   std::atomic<int64_t> reads(0);
@@ -201,11 +199,10 @@ TEST(RWSpinLock, concurrent_holder_test) {
     while (!stop.load(std::memory_order_acquire)) {
       auto r = (uint32_t)(rand()) % 10;
       if (r < 3) {          // starts from write lock
-        RWSpinLock::ReadHolder rg(
-            RWSpinLock::UpgradedHolder ug(
-              RWSpinLock::WriteHolder(&lock)));
+        RWSpinLock::ReadHolder rg{
+          RWSpinLock::UpgradedHolder{
+            RWSpinLock::WriteHolder{&lock}}};
         writes.fetch_add(1, std::memory_order_acq_rel);;
-
       } else if (r < 6) {   // starts from upgrade lock
         RWSpinLock::UpgradedHolder ug(&lock);
         if (r < 4) {
@@ -215,17 +212,15 @@ TEST(RWSpinLock, concurrent_holder_test) {
         }
         upgrades.fetch_add(1, std::memory_order_acq_rel);;
       } else {
-        RWSpinLock::UpgradedHolder ug(
-            RWSpinLock::WriteHolder(
-              RWSpinLock::ReadHolder(&lock)));
+        RWSpinLock::ReadHolder rg{&lock};
         reads.fetch_add(1, std::memory_order_acq_rel);
       }
     }
   };
 
-  std::vector<boost::thread> threads;
+  std::vector<std::thread> threads;
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(boost::thread(go));
+    threads.push_back(std::thread(go));
   }
 
   sleep(5);
@@ -242,6 +237,6 @@ TEST(RWSpinLock, concurrent_holder_test) {
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   return RUN_ALL_TESTS();
 }

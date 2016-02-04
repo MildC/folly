@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -41,9 +41,11 @@
 #ifndef FOLLY_JSON_H_
 #define FOLLY_JSON_H_
 
-#include "folly/dynamic.h"
-#include "folly/FBString.h"
-#include "folly/Range.h"
+#include <iosfwd>
+
+#include <folly/dynamic.h>
+#include <folly/FBString.h>
+#include <folly/Range.h>
 
 namespace folly {
 
@@ -58,6 +60,14 @@ namespace json {
       , pretty_formatting(false)
       , encode_non_ascii(false)
       , validate_utf8(false)
+      , allow_trailing_comma(false)
+      , sort_keys(false)
+      , skip_invalid_utf8(false)
+      , allow_nan_inf(false)
+      , double_mode(double_conversion::DoubleToStringConverter::SHORTEST)
+      , double_num_digits(0) // ignored when mode is SHORTEST
+      , double_fallback(false)
+      , parse_numbers_as_strings(false)
     {}
 
     // If true, keys in an object can be non-strings.  (In strict
@@ -81,6 +91,31 @@ namespace json {
 
     // Check that strings are valid utf8
     bool validate_utf8;
+
+    // Allow trailing comma in lists of values / items
+    bool allow_trailing_comma;
+
+    // Sort keys of all objects before printing out (potentially slow)
+    bool sort_keys;
+
+    // Replace invalid utf8 characters with U+FFFD and continue
+    bool skip_invalid_utf8;
+
+    // true to allow NaN or INF values
+    bool allow_nan_inf;
+
+    // Options for how to print floating point values.  See Conv.h
+    // toAppend implementation for floating point for more info
+    double_conversion::DoubleToStringConverter::DtoaMode double_mode;
+    unsigned int double_num_digits;
+
+    // Fallback to double when a value that looks like integer is too big to
+    // fit in an int64_t. Can result in loss a of precision.
+    bool double_fallback;
+
+    // Do not parse numbers. Instead, store them as strings and leave the
+    // conversion up to the user.
+    bool parse_numbers_as_strings;
   };
 
   /*
@@ -90,6 +125,19 @@ namespace json {
    */
   fbstring serialize(dynamic const&, serialization_opts const&);
 
+  /*
+   * Escape a string so that it is legal to print it in JSON text and
+   * append the result to out.
+   */
+
+  void escapeString(StringPiece input,
+                    fbstring& out,
+                    const serialization_opts& opts);
+
+  /*
+   * Strip all C99-like comments (i.e. // and / * ... * /)
+   */
+  fbstring stripComments(StringPiece jsonC);
 }
 
 //////////////////////////////////////////////////////////////////////
@@ -98,6 +146,7 @@ namespace json {
  * Parse a json blob out of a range and produce a dynamic representing
  * it.
  */
+dynamic parseJson(StringPiece, json::serialization_opts const&);
 dynamic parseJson(StringPiece);
 
 /*
@@ -111,6 +160,11 @@ fbstring toJson(dynamic const&);
  */
 fbstring toPrettyJson(dynamic const&);
 
+/*
+ * Printer for GTest.
+ * Uppercase name to fill GTest's API, which calls this method through ADL.
+ */
+void PrintTo(const dynamic&, std::ostream*);
 //////////////////////////////////////////////////////////////////////
 
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
  * limitations under the License.
  */
 
-#include "folly/Foreach.h"
+#include <folly/Foreach.h>
 
-#include "folly/Benchmark.h"
+#include <folly/Benchmark.h>
 #include <gtest/gtest.h>
 #include <map>
 #include <string>
@@ -25,6 +25,20 @@
 
 using namespace folly;
 using namespace folly::detail;
+
+TEST(Foreach, ForEachRvalue) {
+  const char* const hello = "hello";
+  int n = 0;
+  FOR_EACH(it, std::string(hello)) {
+    ++n;
+  }
+  EXPECT_EQ(strlen(hello), n);
+  FOR_EACH_R(it, std::string(hello)) {
+    --n;
+    EXPECT_EQ(hello[n], *it);
+  }
+  EXPECT_EQ(0, n);
+}
 
 TEST(Foreach, ForEachKV) {
   std::map<std::string, int> testMap;
@@ -161,9 +175,9 @@ TEST(Foreach, ForEachRangeR) {
 
 std::map<int, std::string> bmMap;  // For use in benchmarks below.
 
-void setupBenchmark(int iters) {
+void setupBenchmark(size_t iters) {
   bmMap.clear();
-  for (int i = 0; i < iters; ++i) {
+  for (size_t i = 0; i < iters; ++i) {
     bmMap[i] = "teststring";
   }
 }
@@ -174,8 +188,6 @@ BENCHMARK(ForEachKVNoMacroAssign, iters) {
 
   BENCHMARK_SUSPEND {
     setupBenchmark(iters);
-    int sumKeys = 0;
-    std::string sumValues = "";
   }
 
   FOR_EACH (iter, bmMap) {
@@ -201,11 +213,12 @@ BENCHMARK(ForEachKVNoMacroNoAssign, iters) {
 }
 
 BENCHMARK(ManualLoopNoAssign, iters) {
+  int sumKeys = 0;
+  std::string sumValues;
+
   BENCHMARK_SUSPEND {
     setupBenchmark(iters);
   }
-  int sumKeys = 0;
-  std::string sumValues;
 
   for (auto iter = bmMap.begin(); iter != bmMap.end(); ++iter) {
     sumKeys += iter->first;
@@ -214,11 +227,12 @@ BENCHMARK(ManualLoopNoAssign, iters) {
 }
 
 BENCHMARK(ForEachKVMacro, iters) {
+  int sumKeys = 0;
+  std::string sumValues;
+
   BENCHMARK_SUSPEND {
     setupBenchmark(iters);
   }
-  int sumKeys = 0;
-  std::string sumValues;
 
   FOR_EACH_KV (k, v, bmMap) {
     sumKeys += k;
@@ -228,7 +242,7 @@ BENCHMARK(ForEachKVMacro, iters) {
 
 BENCHMARK(ForEachManual, iters) {
   int sum = 1;
-  for (auto i = 1; i < iters; ++i) {
+  for (size_t i = 1; i < iters; ++i) {
     sum *= i;
   }
   doNotOptimizeAway(sum);
@@ -244,7 +258,7 @@ BENCHMARK(ForEachRange, iters) {
 
 BENCHMARK(ForEachDescendingManual, iters) {
   int sum = 1;
-  for (auto i = iters; i-- > 1; ) {
+  for (size_t i = iters; i-- > 1; ) {
     sum *= i;
   }
   doNotOptimizeAway(sum);
@@ -252,7 +266,7 @@ BENCHMARK(ForEachDescendingManual, iters) {
 
 BENCHMARK(ForEachRangeR, iters) {
   int sum = 1;
-  FOR_EACH_RANGE_R (i, 1, iters) {
+  FOR_EACH_RANGE_R (i, 1U, iters) {
     sum *= i;
   }
   doNotOptimizeAway(sum);

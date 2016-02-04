@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,11 +17,19 @@
 // @author Tudor Bosman (tudorb@fb.com)
 
 #include <gflags/gflags.h>
-#include "folly/Bits.h"
-#include "folly/Benchmark.h"
+#include <folly/Bits.h>
+#include <folly/Benchmark.h>
 #include <gtest/gtest.h>
 
 using namespace folly;
+
+// Test constexpr-ness.
+#ifndef __clang__
+static_assert(findFirstSet(2u) == 2, "findFirstSet");
+static_assert(findLastSet(2u) == 2, "findLastSet");
+static_assert(nextPowTwo(2u) == 2, "nextPowTwo");
+static_assert(isPowTwo(2u), "isPowTwo");
+#endif  // __clang__
 
 namespace {
 
@@ -38,12 +46,6 @@ void testFFS() {
 }
 
 template <class INT>
-unsigned int findLastSetPortable(INT x) {
-  return detail::findLastSetPortable(
-      static_cast<typename std::make_unsigned<INT>::type>(x));
-}
-
-template <class INT>
 void testFLS() {
   typedef typename std::make_unsigned<INT>::type UINT;
   EXPECT_EQ(0, findLastSet(static_cast<INT>(0)));
@@ -51,11 +53,9 @@ void testFLS() {
   for (size_t i = 0; i < bits; i++) {
     INT v1 = static_cast<UINT>(1) << i;
     EXPECT_EQ(i + 1, findLastSet(v1));
-    EXPECT_EQ(i + 1, findLastSetPortable(v1));
 
     INT v2 = (static_cast<UINT>(1) << i) - 1;
     EXPECT_EQ(i, findLastSet(v2));
-    EXPECT_EQ(i, findLastSetPortable(v2));
   }
 }
 
@@ -113,32 +113,58 @@ TEST(Bits, FindLastSet) {
 }
 
 
-#ifdef __GNUC__
-
 TEST(Bits, nextPowTwoClz) {
   testPowTwo(nextPowTwo);
 }
 
-int x; // prevent the loop from getting optimized away
 BENCHMARK(nextPowTwoClz, iters) {
-  x = folly::nextPowTwo(iters);
+  for (unsigned long i = 0; i < iters; ++i) {
+    auto x = folly::nextPowTwo(iters);
+    folly::doNotOptimizeAway(x);
+  }
 }
 
-#endif
-
-TEST(Bits, nextPowTwoPortable) {
-  testPowTwo(detail::nextPowTwoPortable);
-}
-
-BENCHMARK(nextPowTwoPortable, iters) {
-  x = detail::nextPowTwoPortable(iters);
+TEST(Bits, isPowTwo) {
+  EXPECT_FALSE(isPowTwo(0u));
+  EXPECT_TRUE(isPowTwo(1ul));
+  EXPECT_TRUE(isPowTwo(2ull));
+  EXPECT_FALSE(isPowTwo(3ul));
+  EXPECT_TRUE(isPowTwo(4ul));
+  EXPECT_FALSE(isPowTwo(5ul));
+  EXPECT_TRUE(isPowTwo(8ul));
+  EXPECT_FALSE(isPowTwo(15u));
+  EXPECT_TRUE(isPowTwo(16u));
+  EXPECT_FALSE(isPowTwo(17u));
+  EXPECT_FALSE(isPowTwo(511ul));
+  EXPECT_TRUE(isPowTwo(512ul));
+  EXPECT_FALSE(isPowTwo(513ul));
+  EXPECT_FALSE(isPowTwo((1ul<<31) - 1));
+  EXPECT_TRUE(isPowTwo(1ul<<31));
+  EXPECT_FALSE(isPowTwo((1ul<<31) + 1));
+  EXPECT_FALSE(isPowTwo((1ull<<63) - 1));
+  EXPECT_TRUE(isPowTwo(1ull<<63));
+  EXPECT_FALSE(isPowTwo((1ull<<63) + 1));
 }
 
 BENCHMARK_DRAW_LINE();
+BENCHMARK(isPowTwo, iters) {
+  bool b;
+  for (unsigned long i = 0; i < iters; ++i) {
+    b = folly::isPowTwo(i);
+    folly::doNotOptimizeAway(b);
+  }
+}
+
+TEST(Bits, popcount) {
+  EXPECT_EQ(0, popcount(0U));
+  EXPECT_EQ(1, popcount(1U));
+  EXPECT_EQ(32, popcount(uint32_t(-1)));
+  EXPECT_EQ(64, popcount(uint64_t(-1)));
+}
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   auto ret = RUN_ALL_TESTS();
   if (!ret && FLAGS_benchmark) {
     folly::runBenchmarks();
@@ -153,5 +179,4 @@ Benchmarks run on dual Xeon X5650's @ 2.67GHz w/hyperthreading enabled
 Benchmark                               Iters   Total t    t/iter iter/sec
 ------------------------------------------------------------------------------
 *       nextPowTwoClz                 1000000  1.659 ms  1.659 ns  574.8 M
- +66.8% nextPowTwoPortable            1000000  2.767 ms  2.767 ns  344.7 M
 */

@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,6 @@
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
-#include <boost/noncopyable.hpp>
 
 namespace folly {
 
@@ -35,8 +34,11 @@ namespace folly {
  * without locks.
  */
 template<class T>
-struct ProducerConsumerQueue : private boost::noncopyable {
+struct ProducerConsumerQueue {
   typedef T value_type;
+
+  ProducerConsumerQueue(const ProducerConsumerQueue&) = delete;
+  ProducerConsumerQueue& operator = (const ProducerConsumerQueue&) = delete;
 
   // size must be >= 2.
   //
@@ -59,9 +61,9 @@ struct ProducerConsumerQueue : private boost::noncopyable {
     // We need to destruct anything that may still exist in our queue.
     // (No real synchronization needed at destructor time: only one
     // thread can be doing this.)
-    if (!std::has_trivial_destructor<T>::value) {
-      int read = readIndex_;
-      int end = writeIndex_;
+    if (!std::is_trivially_destructible<T>::value) {
+      size_t read = readIndex_;
+      size_t end = writeIndex_;
       while (read != end) {
         records_[read].~T();
         if (++read == size_) {
@@ -149,12 +151,26 @@ struct ProducerConsumerQueue : private boost::noncopyable {
     return true;
   }
 
+  // * If called by consumer, then true size may be more (because producer may
+  //   be adding items concurrently).
+  // * If called by producer, then true size may be less (because consumer may
+  //   be removing items concurrently).
+  // * It is undefined to call this from any other thread.
+  size_t sizeGuess() const {
+    int ret = writeIndex_.load(std::memory_order_consume) -
+              readIndex_.load(std::memory_order_consume);
+    if (ret < 0) {
+      ret += size_;
+    }
+    return ret;
+  }
+
 private:
   const uint32_t size_;
   T* const records_;
 
-  std::atomic<int> readIndex_;
-  std::atomic<int> writeIndex_;
+  std::atomic<unsigned int> readIndex_;
+  std::atomic<unsigned int> writeIndex_;
 };
 
 }

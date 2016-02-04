@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,8 +40,12 @@ template <class Mutex> void testDualLockingWithConst();
 
 template <class Mutex> void testTimedSynchronized();
 
+template <class Mutex> void testTimedSynchronizedWithConst();
+
 template <class Mutex> void testConstCopy();
 
-#include "folly/test/SynchronizedTestLib-inl.h"
+template <class Mutex> void testInPlaceConstruction();
+
+#include <folly/test/SynchronizedTestLib-inl.h>
 
 #endif /* FOLLY_TEST_SYNCHRONIZEDTESTLIB_H */

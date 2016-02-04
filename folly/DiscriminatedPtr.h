@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,11 +30,12 @@
 #include <limits>
 #include <stdexcept>
 #include <glog/logging.h>
-#include "folly/Likely.h"
-#include "folly/detail/DiscriminatedPtrDetail.h"
+#include <folly/Likely.h>
+#include <folly/Portability.h>
+#include <folly/detail/DiscriminatedPtrDetail.h>
 
-#ifndef __x86_64__
-# error "DiscriminatedPtr is x64-specific code."
+#if !FOLLY_X64 && !FOLLY_PPC64
+# error "DiscriminatedPtr is x64 and ppc64 specific code."
 #endif
 
 namespace folly {
@@ -218,4 +219,3 @@ class DiscriminatedPtr {
 }  // namespace folly
 
 #endif /* FOLLY_DISCRIMINATEDPTR_H_ */
-

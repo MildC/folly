@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,64 +14,67 @@
  * limitations under the License.
  */
 
-#include "folly/experimental/TestUtil.h"
+#include <folly/experimental/TestUtil.h>
 
-#include <stdlib.h>
-#include <errno.h>
-#include <stdexcept>
-#include <system_error>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-#include "folly/Format.h"
+#include <boost/regex.hpp>
+#include <folly/Conv.h>
+#include <folly/Exception.h>
+#include <folly/File.h>
+#include <folly/FileUtil.h>
+#include <folly/String.h>
+
+#ifndef _MSC_VER
+extern char** environ;
+#endif
 
 namespace folly {
 namespace test {
 
-TemporaryFile::TemporaryFile(const char* prefix, Scope scope,
+namespace {
+
+fs::path generateUniquePath(fs::path path, StringPiece namePrefix) {
+  if (path.empty()) {
+    path = fs::temp_directory_path();
+  }
+  if (namePrefix.empty()) {
+    path /= fs::unique_path();
+  } else {
+    path /= fs::unique_path(
+        to<std::string>(namePrefix, ".%%%%-%%%%-%%%%-%%%%"));
+  }
+  return path;
+}
+
+}  // namespace
+
+TemporaryFile::TemporaryFile(StringPiece namePrefix,
+                             fs::path dir,
+                             Scope scope,
                              bool closeOnDestruction)
   : scope_(scope),
-    closeOnDestruction_(closeOnDestruction) {
-  static const char* suffix = ".XXXXXX";  // per mkstemp(3)
-  if (!prefix || prefix[0] == '\0') {
-    prefix = "temp";
-  }
-  const char* dir = nullptr;
-  if (!strchr(prefix, '/')) {
-    // Not a full path, try getenv("TMPDIR") or "/tmp"
-    dir = getenv("TMPDIR");
-    if (!dir) {
-      dir = "/tmp";
-    }
-    // The "!" is a placeholder to ensure that &(path[0]) is null-terminated.
-    // This is the only standard-compliant way to get at a null-terminated
-    // non-const char string inside a std::string: put the null-terminator
-    // yourself.
-    path_ = format("{}/{}{}!", dir, prefix, suffix).str();
-  } else {
-    path_ = format("{}{}!", prefix, suffix).str();
-  }
-
-  // Replace the '!' with a null terminator, we'll get rid of it later
-  path_[path_.size() - 1] = '\0';
-
-  fd_ = mkstemp(&(path_[0]));
-  if (fd_ == -1) {
-    throw std::system_error(errno, std::system_category(),
-                            format("mkstemp failed: {}", path_).str().c_str());
-  }
-
-  DCHECK_EQ(path_[path_.size() - 1], '\0');
-  path_.erase(path_.size() - 1);
+    closeOnDestruction_(closeOnDestruction),
+    fd_(-1),
+    path_(generateUniquePath(std::move(dir), namePrefix)) {
+  fd_ = open(path_.string().c_str(), O_RDWR | O_CREAT | O_EXCL, 0666);
+  checkUnixError(fd_, "open failed");
 
   if (scope_ == Scope::UNLINK_IMMEDIATELY) {
-    if (unlink(path_.c_str()) == -1) {
-      throw std::system_error(errno, std::system_category(),
-                              format("unlink failed: {}", path_).str().c_str());
+    boost::system::error_code ec;
+    fs::remove(path_, ec);
+    if (ec) {
+      LOG(WARNING) << "unlink on construction failed: " << ec;
+    } else {
+      path_.clear();
     }
-    path_.clear();  // path no longer available or meaningful
   }
 }
 
-const std::string& TemporaryFile::path() const {
+const fs::path& TemporaryFile::path() const {
   CHECK(scope_ != Scope::UNLINK_IMMEDIATELY);
   DCHECK(!path_.empty());
   return path_;
@@ -87,9 +90,130 @@ TemporaryFile::~TemporaryFile() {
   // If we previously failed to unlink() (UNLINK_IMMEDIATELY), we'll
   // try again here.
   if (scope_ != Scope::PERMANENT && !path_.empty()) {
-    if (unlink(path_.c_str()) == -1) {
-      PLOG(ERROR) << "unlink(" << path_ << ") failed";
+    boost::system::error_code ec;
+    fs::remove(path_, ec);
+    if (ec) {
+      LOG(WARNING) << "unlink on destruction failed: " << ec;
     }
+  }
+}
+
+TemporaryDirectory::TemporaryDirectory(StringPiece namePrefix,
+                                       fs::path dir,
+                                       Scope scope)
+  : scope_(scope),
+    path_(generateUniquePath(std::move(dir), namePrefix)) {
+  fs::create_directory(path_);
+}
+
+TemporaryDirectory::~TemporaryDirectory() {
+  if (scope_ == Scope::DELETE_ON_DESTRUCTION) {
+    boost::system::error_code ec;
+    fs::remove_all(path_, ec);
+    if (ec) {
+      LOG(WARNING) << "recursive delete on destruction failed: " << ec;
+    }
+  }
+}
+
+ChangeToTempDir::ChangeToTempDir() : initialPath_(fs::current_path()) {
+  std::string p = dir_.path().string();
+  ::chdir(p.c_str());
+}
+
+ChangeToTempDir::~ChangeToTempDir() {
+  std::string p = initialPath_.string();
+  ::chdir(p.c_str());
+}
+
+namespace detail {
+
+bool hasPCREPatternMatch(StringPiece pattern, StringPiece target) {
+  return boost::regex_match(
+    target.begin(),
+    target.end(),
+    boost::regex(pattern.begin(), pattern.end())
+  );
+}
+
+bool hasNoPCREPatternMatch(StringPiece pattern, StringPiece target) {
+  return !hasPCREPatternMatch(pattern, target);
+}
+
+}  // namespace detail
+
+CaptureFD::CaptureFD(int fd, ChunkCob chunk_cob)
+    : chunkCob_(std::move(chunk_cob)), fd_(fd), readOffset_(0) {
+  oldFDCopy_ = dup(fd_);
+  PCHECK(oldFDCopy_ != -1) << "Could not copy FD " << fd_;
+
+  int file_fd = open(file_.path().string().c_str(), O_WRONLY|O_CREAT, 0600);
+  PCHECK(dup2(file_fd, fd_) != -1) << "Could not replace FD " << fd_
+    << " with " << file_fd;
+  PCHECK(close(file_fd) != -1) << "Could not close " << file_fd;
+}
+
+void CaptureFD::release() {
+  if (oldFDCopy_ != fd_) {
+    readIncremental();  // Feed chunkCob_
+    PCHECK(dup2(oldFDCopy_, fd_) != -1) << "Could not restore old FD "
+      << oldFDCopy_ << " into " << fd_;
+    PCHECK(close(oldFDCopy_) != -1) << "Could not close " << oldFDCopy_;
+    oldFDCopy_ = fd_;  // Make this call idempotent
+  }
+}
+
+CaptureFD::~CaptureFD() {
+  release();
+}
+
+std::string CaptureFD::read() const {
+  std::string contents;
+  std::string filename = file_.path().string();
+  PCHECK(folly::readFile(filename.c_str(), contents));
+  return contents;
+}
+
+std::string CaptureFD::readIncremental() {
+  std::string filename = file_.path().string();
+  // Yes, I know that I could just keep the file open instead. So sue me.
+  folly::File f(openNoInt(filename.c_str(), O_RDONLY), true);
+  auto size = lseek(f.fd(), 0, SEEK_END) - readOffset_;
+  std::unique_ptr<char[]> buf(new char[size]);
+  auto bytes_read = folly::preadFull(f.fd(), buf.get(), size, readOffset_);
+  PCHECK(size == bytes_read);
+  readOffset_ += size;
+  chunkCob_(StringPiece(buf.get(), buf.get() + size));
+  return std::string(buf.get(), size);
+}
+
+static std::map<std::string, std::string> getEnvVarMap() {
+  std::map<std::string, std::string> data;
+  for (auto it = environ; *it != nullptr; ++it) {
+    std::string key, value;
+    split("=", *it, key, value);
+    if (key.empty()) {
+      continue;
+    }
+    CHECK(!data.count(key)) << "already contains: " << key;
+    data.emplace(move(key), move(value));
+  }
+  return data;
+}
+
+EnvVarSaver::EnvVarSaver() {
+  saved_ = getEnvVarMap();
+}
+
+EnvVarSaver::~EnvVarSaver() {
+  for (const auto& kvp : getEnvVarMap()) {
+    if (saved_.count(kvp.first)) {
+      continue;
+    }
+    PCHECK(0 == unsetenv(kvp.first.c_str()));
+  }
+  for (const auto& kvp : saved_) {
+    PCHECK(0 == setenv(kvp.first.c_str(), kvp.second.c_str(), (int)true));
   }
 }
 

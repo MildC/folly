@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,16 +18,14 @@
 
 #include <map>
 #include <set>
-
-#include <boost/shared_ptr.hpp>
-#include <boost/thread.hpp>
+#include <thread>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include "folly/Benchmark.h"
-#include "folly/ConcurrentSkipList.h"
-#include "folly/Hash.h"
-#include "folly/RWSpinLock.h"
+#include <folly/Benchmark.h>
+#include <folly/ConcurrentSkipList.h>
+#include <folly/Hash.h>
+#include <folly/RWSpinLock.h>
 
 
 DEFINE_int32(num_threads, 12, "num concurrent threads to test");
@@ -77,7 +75,7 @@ void BM_IterateOverSet(int iters, int size) {
     if (iter == a_set.end()) iter = a_set.begin();
   }
   BENCHMARK_SUSPEND {
-    VLOG(20) << "sum = " << sum;
+    // VLOG(20) << "sum = " << sum;
   }
 }
 
@@ -98,7 +96,7 @@ void BM_IterateSkipList(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << "sum = " << sum;
+    // VLOG(20) << "sum = " << sum;
   }
 }
 
@@ -119,7 +117,7 @@ void BM_SetMerge(int iters, int size) {
     if (b_set.find(*it) != b_set.end()) mergedSum += *it;
   }
   BENCHMARK_SUSPEND {
-    VLOG(20) << mergedSum;
+    // VLOG(20) << mergedSum;
   }
 }
 
@@ -143,7 +141,7 @@ void BM_CSLMergeLookup(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << mergedSum;
+    // VLOG(20) << mergedSum;
   }
 }
 
@@ -180,7 +178,7 @@ void BM_CSLMergeIntersection(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << mergedSum;
+    // VLOG(20) << mergedSum;
   }
 }
 
@@ -199,7 +197,7 @@ void BM_SetContainsNotFound(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 }
 
@@ -224,7 +222,7 @@ void BM_SetContainsFound(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 }
 
@@ -248,7 +246,7 @@ void BM_CSLContainsFound(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 }
 
@@ -268,7 +266,7 @@ void BM_CSLContainsNotFound(int iters, int size) {
   }
 
   BENCHMARK_SUSPEND {
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 }
 
@@ -304,7 +302,7 @@ BENCHMARK(Accessor, iters) {
   auto sl = skiplist.get();
 
   susp.dismiss();
-  for (int i = 0; i < iters; ++i) {
+  for (size_t i = 0; i < iters; ++i) {
     SkipListAccessor accessor(sl);
   }
 }
@@ -320,7 +318,7 @@ BENCHMARK(accessorBasicRefcounting, iters) {
   l.init();
 
   susp.dismiss();
-  for (int i = 0; i < iters; ++i) {
+  for (size_t i = 0; i < iters; ++i) {
     value->fetch_add(1, std::memory_order_relaxed);
     if (dirty->load(std::memory_order_acquire) != 0) {
       folly::MSLGuard g(l);
@@ -352,6 +350,9 @@ class ConcurrentAccessData {
       if (i > 0) sets_[i] = sets_[0];
     }
 
+// This requires knowledge of the C++ library internals. Only use it if we're
+// using the GNU C++ library.
+#ifdef _GLIBCXX_SYMVER
     // memory usage
     int64_t setMemorySize = sets_[0].size() * sizeof(*sets_[0].begin()._M_node);
     int64_t cslMemorySize = 0;
@@ -362,6 +363,7 @@ class ConcurrentAccessData {
     LOG(INFO) << "size=" << sets_[0].size()
       << "; std::set memory size=" << setMemorySize
       << "; csl memory size=" << cslMemorySize;
+#endif
 
     readValues_.reserve(size);
     deleteValues_.reserve(size);
@@ -382,13 +384,13 @@ class ConcurrentAccessData {
     FOR_EACH(lock, locks_) delete *lock;
   }
 
-  inline bool skipListFind(int idx, ValueType val) {
+  inline bool skipListFind(int /* idx */, ValueType val) {
     return skipList_.contains(val);
   }
-  inline void skipListInsert(int idx, ValueType val) {
+  inline void skipListInsert(int /* idx */, ValueType val) {
     skipList_.add(val);
   }
-  inline void skipListErase(int idx, ValueType val) {
+  inline void skipListErase(int /* idx */, ValueType val) {
     skipList_.remove(val);
   }
 
@@ -405,23 +407,23 @@ class ConcurrentAccessData {
     sets_[idx].erase(val);
   }
 
-  void runSkipList(int id, int iters) {
+  void runSkipList(int id, size_t iters) {
     int sum = 0;
-    for (int i = 0; i < iters; ++i) {
+    for (size_t i = 0; i < iters; ++i) {
       sum += accessSkipList(id, i);
     }
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 
-  void runSet(int id, int iters) {
+  void runSet(size_t id, size_t iters) {
     int sum = 0;
-    for (int i = 0; i < iters; ++i) {
+    for (size_t i = 0; i < iters; ++i) {
       sum += accessSet(id, i);
     }
-    VLOG(20) << sum;
+    // VLOG(20) << sum;
   }
 
-  bool accessSkipList(int64_t id, int t) {
+  bool accessSkipList(int64_t id, size_t t) {
     if (t > readValues_.size()) {
       t = t % readValues_.size();
     }
@@ -439,7 +441,7 @@ class ConcurrentAccessData {
     }
   }
 
-  bool accessSet(int64_t id, int t) {
+  bool accessSet(int64_t id, size_t t) {
     if (t > readValues_.size()) {
       t = t % readValues_.size();
     }
@@ -468,12 +470,12 @@ class ConcurrentAccessData {
   std::vector<ValueType> deleteValues_;
 };
 
-static std::map<int, boost::shared_ptr<ConcurrentAccessData> > g_data;
+static std::map<int, std::shared_ptr<ConcurrentAccessData> > g_data;
 
 static ConcurrentAccessData *mayInitTestData(int size) {
   auto it = g_data.find(size);
   if (it == g_data.end()) {
-    auto ptr = boost::shared_ptr<ConcurrentAccessData>(
+    auto ptr = std::shared_ptr<ConcurrentAccessData>(
         new ConcurrentAccessData(size));
     g_data[size] = ptr;
     return ptr.get();
@@ -484,11 +486,11 @@ static ConcurrentAccessData *mayInitTestData(int size) {
 void BM_ContentionCSL(int iters, int size) {
   BenchmarkSuspender susp;
   auto data = mayInitTestData(size);
-  std::vector<boost::thread> threads;
+  std::vector<std::thread> threads;
   susp.dismiss();
 
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(boost::thread(
+    threads.push_back(std::thread(
           &ConcurrentAccessData::runSkipList, data, i, iters));
   }
   FOR_EACH(t, threads) {
@@ -499,11 +501,11 @@ void BM_ContentionCSL(int iters, int size) {
 void BM_ContentionStdSet(int iters, int size) {
   BenchmarkSuspender susp;
   auto data = mayInitTestData(size);
-  std::vector<boost::thread> threads;
+  std::vector<std::thread> threads;
   susp.dismiss();
 
   for (int i = 0; i < FLAGS_num_threads; ++i) {
-    threads.push_back(boost::thread(
+    threads.push_back(std::thread(
           &ConcurrentAccessData::runSet, data, i, iters));
   }
   FOR_EACH(t, threads) {
@@ -597,7 +599,7 @@ BENCHMARK_DRAW_LINE();
 
 int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
-  google::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   initData();
   runBenchmarks();

@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,20 +14,32 @@
  * limitations under the License.
  */
 
-#include "folly/ThreadLocal.h"
+#include <folly/ThreadLocal.h>
 
-#include <map>
-#include <unordered_map>
-#include <set>
+#include <dlfcn.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <array>
 #include <atomic>
-#include <mutex>
+#include <chrono>
 #include <condition_variable>
+#include <limits.h>
+#include <map>
+#include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
+
 #include <boost/thread/tss.hpp>
-#include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include "folly/Benchmark.h"
+#include <gtest/gtest.h>
+
+#include <folly/Benchmark.h>
+#include <folly/Baton.h>
+#include <folly/experimental/io/FsUtil.h>
 
 using namespace folly;
 
@@ -66,6 +78,49 @@ TEST(ThreadLocalPtr, CustomDeleter1) {
     EXPECT_EQ(10, Widget::totalVal_);
   }
   EXPECT_EQ(10, Widget::totalVal_);
+}
+
+TEST(ThreadLocalPtr, resetNull) {
+  ThreadLocalPtr<int> tl;
+  EXPECT_FALSE(tl);
+  tl.reset(new int(4));
+  EXPECT_TRUE(static_cast<bool>(tl));
+  EXPECT_EQ(*tl.get(), 4);
+  tl.reset();
+  EXPECT_FALSE(tl);
+}
+
+TEST(ThreadLocalPtr, TestRelease) {
+  Widget::totalVal_ = 0;
+  ThreadLocalPtr<Widget> w;
+  std::unique_ptr<Widget> wPtr;
+  std::thread([&w, &wPtr]() {
+      w.reset(new Widget());
+      w.get()->val_ += 10;
+
+      wPtr.reset(w.release());
+    }).join();
+  EXPECT_EQ(0, Widget::totalVal_);
+  wPtr.reset();
+  EXPECT_EQ(10, Widget::totalVal_);
+}
+
+TEST(ThreadLocalPtr, CreateOnThreadExit) {
+  Widget::totalVal_ = 0;
+  ThreadLocal<Widget> w;
+  ThreadLocalPtr<int> tl;
+
+  std::thread([&] {
+    tl.reset(new int(1),
+             [&](int* ptr, TLPDestructionMode /* mode */) {
+               delete ptr;
+               // This test ensures Widgets allocated here are not leaked.
+               ++w.get()->val_;
+               ThreadLocal<Widget> wl;
+               ++wl.get()->val_;
+             });
+  }).join();
+  EXPECT_EQ(2, Widget::totalVal_);
 }
 
 // Test deleting the ThreadLocalPtr object
@@ -151,7 +206,7 @@ TEST(ThreadLocal, SimpleRepeatDestructor) {
 
 TEST(ThreadLocal, InterleavedDestructors) {
   Widget::totalVal_ = 0;
-  ThreadLocal<Widget>* w = NULL;
+  std::unique_ptr<ThreadLocal<Widget>> w;
   int wVersion = 0;
   const int wVersionMax = 2;
   int thIter = 0;
@@ -181,8 +236,7 @@ TEST(ThreadLocal, InterleavedDestructors) {
     {
       std::lock_guard<std::mutex> g(lock);
       thIterPrev = thIter;
-      delete w;
-      w = new ThreadLocal<Widget>();
+      w.reset(new ThreadLocal<Widget>());
       ++wVersion;
     }
     while (true) {
@@ -285,6 +339,279 @@ TEST(ThreadLocal, Movable2) {
   EXPECT_EQ(4, tls.size());
 }
 
+namespace {
+
+constexpr size_t kFillObjectSize = 300;
+
+std::atomic<uint64_t> gDestroyed;
+
+/**
+ * Fill a chunk of memory with a unique-ish pattern that includes the thread id
+ * (so deleting one of these from another thread would cause a failure)
+ *
+ * Verify it explicitly and on destruction.
+ */
+class FillObject {
+ public:
+  explicit FillObject(uint64_t idx) : idx_(idx) {
+    uint64_t v = val();
+    for (size_t i = 0; i < kFillObjectSize; ++i) {
+      data_[i] = v;
+    }
+  }
+
+  void check() {
+    uint64_t v = val();
+    for (size_t i = 0; i < kFillObjectSize; ++i) {
+      CHECK_EQ(v, data_[i]);
+    }
+  }
+
+  ~FillObject() {
+    ++gDestroyed;
+  }
+
+ private:
+  uint64_t val() const {
+    return (idx_ << 40) | uint64_t(pthread_self());
+  }
+
+  uint64_t idx_;
+  uint64_t data_[kFillObjectSize];
+};
+
+}  // namespace
+
+#if FOLLY_HAVE_STD_THIS_THREAD_SLEEP_FOR
+TEST(ThreadLocal, Stress) {
+  constexpr size_t numFillObjects = 250;
+  std::array<ThreadLocalPtr<FillObject>, numFillObjects> objects;
+
+  constexpr size_t numThreads = 32;
+  constexpr size_t numReps = 20;
+
+  std::vector<std::thread> threads;
+  threads.reserve(numThreads);
+
+  for (size_t i = 0; i < numThreads; ++i) {
+    threads.emplace_back([&objects] {
+      for (size_t rep = 0; rep < numReps; ++rep) {
+        for (size_t i = 0; i < objects.size(); ++i) {
+          objects[i].reset(new FillObject(rep * objects.size() + i));
+          std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        for (size_t i = 0; i < objects.size(); ++i) {
+          objects[i]->check();
+        }
+      }
+    });
+  }
+
+  for (auto& t : threads) {
+    t.join();
+  }
+
+  EXPECT_EQ(numFillObjects * numThreads * numReps, gDestroyed);
+}
+#endif
+
+// Yes, threads and fork don't mix
+// (http://cppwisdom.quora.com/Why-threads-and-fork-dont-mix) but if you're
+// stupid or desperate enough to try, we shouldn't stand in your way.
+namespace {
+class HoldsOne {
+ public:
+  HoldsOne() : value_(1) { }
+  // Do an actual access to catch the buggy case where this == nullptr
+  int value() const { return value_; }
+ private:
+  int value_;
+};
+
+struct HoldsOneTag {};
+
+ThreadLocal<HoldsOne, HoldsOneTag> ptr;
+
+int totalValue() {
+  int value = 0;
+  for (auto& p : ptr.accessAllThreads()) {
+    value += p.value();
+  }
+  return value;
+}
+
+}  // namespace
+
+#ifdef FOLLY_HAVE_PTHREAD_ATFORK
+TEST(ThreadLocal, Fork) {
+  EXPECT_EQ(1, ptr->value());  // ensure created
+  EXPECT_EQ(1, totalValue());
+  // Spawn a new thread
+
+  std::mutex mutex;
+  bool started = false;
+  std::condition_variable startedCond;
+  bool stopped = false;
+  std::condition_variable stoppedCond;
+
+  std::thread t([&] () {
+    EXPECT_EQ(1, ptr->value());  // ensure created
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      started = true;
+      startedCond.notify_all();
+    }
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      while (!stopped) {
+        stoppedCond.wait(lock);
+      }
+    }
+  });
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (!started) {
+      startedCond.wait(lock);
+    }
+  }
+
+  EXPECT_EQ(2, totalValue());
+
+  pid_t pid = fork();
+  if (pid == 0) {
+    // in child
+    int v = totalValue();
+
+    // exit successfully if v == 1 (one thread)
+    // diagnostic error code otherwise :)
+    switch (v) {
+    case 1: _exit(0);
+    case 0: _exit(1);
+    }
+    _exit(2);
+  } else if (pid > 0) {
+    // in parent
+    int status;
+    EXPECT_EQ(pid, waitpid(pid, &status, 0));
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+  } else {
+    EXPECT_TRUE(false) << "fork failed";
+  }
+
+  EXPECT_EQ(2, totalValue());
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    stopped = true;
+    stoppedCond.notify_all();
+  }
+
+  t.join();
+
+  EXPECT_EQ(1, totalValue());
+}
+#endif
+
+struct HoldsOneTag2 {};
+
+TEST(ThreadLocal, Fork2) {
+  // A thread-local tag that was used in the parent from a *different* thread
+  // (but not the forking thread) would cause the child to hang in a
+  // ThreadLocalPtr's object destructor. Yeah.
+  ThreadLocal<HoldsOne, HoldsOneTag2> p;
+  {
+    // use tag in different thread
+    std::thread t([&p] { p.get(); });
+    t.join();
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    {
+      ThreadLocal<HoldsOne, HoldsOneTag2> q;
+      q.get();
+    }
+    _exit(0);
+  } else if (pid > 0) {
+    int status;
+    EXPECT_EQ(pid, waitpid(pid, &status, 0));
+    EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(0, WEXITSTATUS(status));
+  } else {
+    EXPECT_TRUE(false) << "fork failed";
+  }
+}
+
+TEST(ThreadLocal, SharedLibrary) {
+  auto exe = fs::executable_path();
+  auto lib = exe.parent_path() / "lib_thread_local_test.so";
+  auto handle = dlopen(lib.string().c_str(), RTLD_LAZY);
+  EXPECT_NE(nullptr, handle);
+
+  typedef void (*useA_t)();
+  dlerror();
+  useA_t useA = (useA_t) dlsym(handle, "useA");
+
+  const char *dlsym_error = dlerror();
+  EXPECT_EQ(nullptr, dlsym_error);
+
+  useA();
+
+  folly::Baton<> b11, b12, b21, b22;
+
+  std::thread t1([&]() {
+      useA();
+      b11.post();
+      b12.wait();
+    });
+
+  std::thread t2([&]() {
+      useA();
+      b21.post();
+      b22.wait();
+    });
+
+  b11.wait();
+  b21.wait();
+
+  dlclose(handle);
+
+  b12.post();
+  b22.post();
+
+  t1.join();
+  t2.join();
+}
+
+namespace folly { namespace threadlocal_detail {
+struct PthreadKeyUnregisterTester {
+  PthreadKeyUnregister p;
+  constexpr PthreadKeyUnregisterTester() = default;
+};
+}}
+
+TEST(ThreadLocal, UnregisterClassHasConstExprCtor) {
+  folly::threadlocal_detail::PthreadKeyUnregisterTester x;
+  // yep!
+  SUCCEED();
+}
+
+// clang is unable to compile this code unless in c++14 mode.
+#if __cplusplus >= 201402L
+namespace {
+// This will fail to compile unless ThreadLocal{Ptr} has a constexpr
+// default constructor. This ensures that ThreadLocal is safe to use in
+// static constructors without worrying about initialization order
+class ConstexprThreadLocalCompile {
+  ThreadLocal<int> a_;
+  ThreadLocalPtr<int> b_;
+
+  constexpr ConstexprThreadLocalCompile() {}
+};
+}
+#endif
+
 // Simple reference implementation using pthread_get_specific
 template<typename T>
 class PThreadGetSpecific {
@@ -337,9 +664,9 @@ BENCHMARK_DRAW_LINE();
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  google::SetCommandLineOptionWithMode(
-    "bm_max_iters", "100000000", google::SET_FLAG_IF_DEFAULT
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::SetCommandLineOptionWithMode(
+    "bm_max_iters", "100000000", gflags::SET_FLAG_IF_DEFAULT
   );
   if (FLAGS_benchmark) {
     folly::runBenchmarks();

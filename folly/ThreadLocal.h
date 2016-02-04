@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,27 +37,11 @@
 #ifndef FOLLY_THREADLOCAL_H_
 #define FOLLY_THREADLOCAL_H_
 
-#include "folly/Portability.h"
+#include <folly/Portability.h>
 #include <boost/iterator/iterator_facade.hpp>
-#include "folly/Likely.h"
+#include <folly/Likely.h>
 #include <type_traits>
 
-// Use noexcept on gcc 4.6 or higher
-#undef FOLLY_NOEXCEPT
-#ifdef __GNUC__
-# ifdef HAVE_FEATURES_H
-#  include <features.h>
-#  if __GNUC_PREREQ(4,6)
-#    define FOLLY_NOEXCEPT noexcept
-#    define FOLLY_ASSERT(x) x
-#  endif
-# endif
-#endif
-
-#ifndef FOLLY_NOEXCEPT
-#  define FOLLY_NOEXCEPT
-#  define FOLLY_ASSERT(x) /**/
-#endif
 
 namespace folly {
 enum class TLPDestructionMode {
@@ -66,7 +50,7 @@ enum class TLPDestructionMode {
 };
 }  // namespace
 
-#include "folly/detail/ThreadLocalDetail.h"
+#include <folly/detail/ThreadLocalDetail.h>
 
 namespace folly {
 
@@ -75,15 +59,22 @@ template<class T, class Tag> class ThreadLocalPtr;
 template<class T, class Tag=void>
 class ThreadLocal {
  public:
-  ThreadLocal() { }
+  constexpr ThreadLocal() : constructor_([]() {
+      return new T();
+    }) {}
+
+  explicit ThreadLocal(std::function<T*()> constructor) :
+      constructor_(constructor) {
+  }
 
   T* get() const {
     T* ptr = tlp_.get();
-    if (UNLIKELY(ptr == NULL)) {
-      ptr = new T();
-      tlp_.reset(ptr);
+    if (LIKELY(ptr != nullptr)) {
+      return ptr;
     }
-    return ptr;
+
+    // separated new item creation out to speed up the fast path.
+    return makeTlp();
   }
 
   T* operator->() const {
@@ -94,7 +85,7 @@ class ThreadLocal {
     return *get();
   }
 
-  void reset(T* newPtr = NULL) {
+  void reset(T* newPtr = nullptr) {
     tlp_.reset(newPtr);
   }
 
@@ -112,7 +103,14 @@ class ThreadLocal {
   ThreadLocal(const ThreadLocal&) = delete;
   ThreadLocal& operator=(const ThreadLocal&) = delete;
 
+  T* makeTlp() const {
+    auto ptr = constructor_();
+    tlp_.reset(ptr);
+    return ptr;
+  }
+
   mutable ThreadLocalPtr<T,Tag> tlp_;
+  std::function<T*()> constructor_;
 };
 
 /*
@@ -133,22 +131,29 @@ class ThreadLocal {
  * We use a single global pthread_key_t per Tag to manage object destruction and
  * memory cleanup upon thread exit because there is a finite number of
  * pthread_key_t's available per machine.
+ *
+ * NOTE: Apple platforms don't support the same semantics for __thread that
+ *       Linux does (and it's only supported at all on i386). For these, use
+ *       pthread_setspecific()/pthread_getspecific() for the per-thread
+ *       storage.  Windows (MSVC and GCC) does support the same semantics
+ *       with __declspec(thread)
  */
 
 template<class T, class Tag=void>
 class ThreadLocalPtr {
+ private:
+  typedef threadlocal_detail::StaticMeta<Tag> StaticMeta;
  public:
-  ThreadLocalPtr() : id_(threadlocal_detail::StaticMeta<Tag>::create()) { }
+  constexpr ThreadLocalPtr() : id_() {}
 
-  ThreadLocalPtr(ThreadLocalPtr&& other) : id_(other.id_) {
-    other.id_ = 0;
+  ThreadLocalPtr(ThreadLocalPtr&& other) noexcept :
+    id_(std::move(other.id_)) {
   }
 
   ThreadLocalPtr& operator=(ThreadLocalPtr&& other) {
     assert(this != &other);
     destroy();
-    id_ = other.id_;
-    other.id_ = 0;
+    id_ = std::move(other.id_);
     return *this;
   }
 
@@ -157,7 +162,8 @@ class ThreadLocalPtr {
   }
 
   T* get() const {
-    return static_cast<T*>(threadlocal_detail::StaticMeta<Tag>::get(id_).ptr);
+    threadlocal_detail::ElementWrapper& w = StaticMeta::get(&id_);
+    return static_cast<T*>(w.ptr);
   }
 
   T* operator->() const {
@@ -168,13 +174,23 @@ class ThreadLocalPtr {
     return *get();
   }
 
-  void reset(T* newPtr) {
-    threadlocal_detail::ElementWrapper& w =
-      threadlocal_detail::StaticMeta<Tag>::get(id_);
+  T* release() {
+    threadlocal_detail::ElementWrapper& w = StaticMeta::get(&id_);
+
+    return static_cast<T*>(w.release());
+  }
+
+  void reset(T* newPtr = nullptr) {
+    threadlocal_detail::ElementWrapper& w = StaticMeta::get(&id_);
+
     if (w.ptr != newPtr) {
       w.dispose(TLPDestructionMode::THIS_THREAD);
       w.set(newPtr);
     }
+  }
+
+  explicit operator bool() const {
+    return get() != nullptr;
   }
 
   /**
@@ -186,8 +202,7 @@ class ThreadLocalPtr {
    */
   template <class Deleter>
   void reset(T* newPtr, Deleter deleter) {
-    threadlocal_detail::ElementWrapper& w =
-      threadlocal_detail::StaticMeta<Tag>::get(id_);
+    threadlocal_detail::ElementWrapper& w = StaticMeta::get(&id_);
     if (w.ptr != newPtr) {
       w.dispose(TLPDestructionMode::THIS_THREAD);
       w.set(newPtr, deleter);
@@ -201,8 +216,8 @@ class ThreadLocalPtr {
     friend class ThreadLocalPtr<T,Tag>;
 
     threadlocal_detail::StaticMeta<Tag>& meta_;
-    boost::mutex* lock_;
-    int id_;
+    std::mutex* lock_;
+    uint32_t id_;
 
    public:
     class Iterator;
@@ -272,15 +287,15 @@ class ThreadLocalPtr {
     Accessor(const Accessor&) = delete;
     Accessor& operator=(const Accessor&) = delete;
 
-    Accessor(Accessor&& other) FOLLY_NOEXCEPT
+    Accessor(Accessor&& other) noexcept
       : meta_(other.meta_),
         lock_(other.lock_),
         id_(other.id_) {
       other.id_ = 0;
-      other.lock_ = NULL;
+      other.lock_ = nullptr;
     }
 
-    Accessor& operator=(Accessor&& other) FOLLY_NOEXCEPT {
+    Accessor& operator=(Accessor&& other) noexcept {
       // Each Tag has its own unique meta, and accessors with different Tags
       // have different types.  So either *this is empty, or this and other
       // have the same tag.  But if they have the same tag, they have the same
@@ -288,7 +303,7 @@ class ThreadLocalPtr {
       // which is impossible, which leaves only one possible scenario --
       // *this is empty.  Assert it.
       assert(&meta_ == &other.meta_);
-      assert(lock_ == NULL);
+      assert(lock_ == nullptr);
       using std::swap;
       swap(lock_, other.lock_);
       swap(id_, other.id_);
@@ -296,12 +311,12 @@ class ThreadLocalPtr {
 
     Accessor()
       : meta_(threadlocal_detail::StaticMeta<Tag>::instance()),
-        lock_(NULL),
+        lock_(nullptr),
         id_(0) {
     }
 
    private:
-    explicit Accessor(int id)
+    explicit Accessor(uint32_t id)
       : meta_(threadlocal_detail::StaticMeta<Tag>::instance()),
         lock_(&meta_.lock_) {
       lock_->lock();
@@ -312,7 +327,7 @@ class ThreadLocalPtr {
       if (lock_) {
         lock_->unlock();
         id_ = 0;
-        lock_ = NULL;
+        lock_ = nullptr;
       }
     }
   };
@@ -320,26 +335,22 @@ class ThreadLocalPtr {
   // accessor allows a client to iterate through all thread local child
   // elements of this ThreadLocal instance.  Holds a global lock for each <Tag>
   Accessor accessAllThreads() const {
-    FOLLY_ASSERT(static_assert(!std::is_same<Tag, void>::value,
-                 "Must use a unique Tag to use the accessAllThreads feature"));
-    return Accessor(id_);
+    static_assert(!std::is_same<Tag, void>::value,
+                  "Must use a unique Tag to use the accessAllThreads feature");
+    return Accessor(id_.getOrAllocate());
   }
 
  private:
   void destroy() {
-    if (id_) {
-      threadlocal_detail::StaticMeta<Tag>::destroy(id_);
-    }
+    StaticMeta::destroy(&id_);
   }
 
   // non-copyable
   ThreadLocalPtr(const ThreadLocalPtr&) = delete;
   ThreadLocalPtr& operator=(const ThreadLocalPtr&) = delete;
 
-  int id_;  // every instantiation has a unique id
+  mutable typename StaticMeta::EntryID id_;
 };
-
-#undef FOLLY_NOEXCEPT
 
 }  // namespace folly
 

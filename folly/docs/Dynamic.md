@@ -29,7 +29,7 @@ folly::dynamic;` was used):
     dynamic array = { "array ", "of ", 4, " elements" };
     assert(array.size() == 4);
     dynamic emptyArray = {};
-    assert(array.empty());
+    assert(emptyArray.empty());
 
     // Maps from dynamics to dynamics are called objects.  The
     // dynamic::object constant is how you make an empty map from dynamics
@@ -72,6 +72,8 @@ Explicit type conversions can be requested for some of the basic types:
     dynamic hugeDoub = hugeInt.asDouble();  // throws a folly/Conv.h error,
                                             // since it can't fit in a double
 ```
+
+For more complicated conversions, see [DynamicConverter](DynamicConverter.md).
 
 ### Iteration and Lookup
 ***
@@ -183,6 +185,17 @@ didn't leave `d.isArray()` true, but on the other hand it would
 also be surprising if `dynamic d` left `d.isArray()` as true. The
 solution was just to disallow uninitialized dynamics: every
 dynamic must start out being assigned to some value (or nullptr).
+
+**Q. Why doesn't a dynamic string support begin(), end(), and operator[]?**
+
+The value_type of a dynamic iterator is `dynamic`, and `operator[]`
+(or the `at()` function) has to return a reference to a dynamic.  If
+we wanted this to work for strings, this would mean we'd have to
+support dynamics with a character type, and moreover that the internal
+representation of strings would be such that we can hand out
+references to dynamic as accessors on individual characters.  There
+are a lot of potential efficiency drawbacks with this, and it seems
+like a feature that is not needed too often in practice.
 
 **Q. Isn't this just a poor imitation of the C# language feature?**
 

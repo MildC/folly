@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,8 +24,11 @@
 #define FOLLY_THREADCACHEDINT_H
 
 #include <atomic>
-#include "folly/Likely.h"
-#include "folly/ThreadLocal.h"
+
+#include <boost/noncopyable.hpp>
+
+#include <folly/Likely.h>
+#include <folly/ThreadLocal.h>
 
 namespace folly {
 
@@ -45,7 +48,7 @@ class ThreadCachedInt : boost::noncopyable {
 
   void increment(IntT inc) {
     auto cache = cache_.get();
-    if (UNLIKELY(cache == NULL || cache->parent_ == NULL)) {
+    if (UNLIKELY(cache == nullptr || cache->parent_ == nullptr)) {
       cache = new IntCache(*this);
       cache_.reset(cache);
     }
@@ -119,7 +122,7 @@ class ThreadCachedInt : boost::noncopyable {
   // need to make sure we signal that this parent is dead.
   ~ThreadCachedInt() {
     for (auto& cache : cache_.accessAllThreads()) {
-      cache.parent_ = NULL;
+      cache.parent_ = nullptr;
     }
   }
 

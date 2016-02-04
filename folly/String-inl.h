@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #define FOLLY_STRING_INL_H_
 
 #include <stdexcept>
+#include <iterator>
 
 #ifndef FOLLY_BASE_STRING_H_
 #error This file may only be included from String.h
@@ -149,6 +150,94 @@ void cUnescape(StringPiece str, String& out, bool strict) {
 }
 
 namespace detail {
+// Map from character code to escape mode:
+// 0 = pass through
+// 1 = unused
+// 2 = pass through in PATH mode
+// 3 = space, replace with '+' in QUERY mode
+// 4 = percent-encode
+extern const unsigned char uriEscapeTable[];
+}  // namespace detail
+
+template <class String>
+void uriEscape(StringPiece str, String& out, UriEscapeMode mode) {
+  static const char hexValues[] = "0123456789abcdef";
+  char esc[3];
+  esc[0] = '%';
+  // Preallocate assuming that 25% of the input string will be escaped
+  out.reserve(out.size() + str.size() + 3 * (str.size() / 4));
+  auto p = str.begin();
+  auto last = p;  // last regular character
+  // We advance over runs of passthrough characters and copy them in one go;
+  // this is faster than calling push_back repeatedly.
+  unsigned char minEncode = static_cast<unsigned char>(mode);
+  while (p != str.end()) {
+    char c = *p;
+    unsigned char v = static_cast<unsigned char>(c);
+    unsigned char discriminator = detail::uriEscapeTable[v];
+    if (LIKELY(discriminator <= minEncode)) {
+      ++p;
+    } else if (mode == UriEscapeMode::QUERY && discriminator == 3) {
+      out.append(&*last, p - last);
+      out.push_back('+');
+      ++p;
+      last = p;
+    } else {
+      out.append(&*last, p - last);
+      esc[1] = hexValues[v >> 4];
+      esc[2] = hexValues[v & 0x0f];
+      out.append(esc, 3);
+      ++p;
+      last = p;
+    }
+  }
+  out.append(&*last, p - last);
+}
+
+template <class String>
+void uriUnescape(StringPiece str, String& out, UriEscapeMode mode) {
+  out.reserve(out.size() + str.size());
+  auto p = str.begin();
+  auto last = p;
+  // We advance over runs of passthrough characters and copy them in one go;
+  // this is faster than calling push_back repeatedly.
+  while (p != str.end()) {
+    char c = *p;
+    switch (c) {
+    case '%':
+      {
+        if (UNLIKELY(std::distance(p, str.end()) < 3)) {
+          throw std::invalid_argument("incomplete percent encode sequence");
+        }
+        auto h1 = detail::hexTable[static_cast<unsigned char>(p[1])];
+        auto h2 = detail::hexTable[static_cast<unsigned char>(p[2])];
+        if (UNLIKELY(h1 == 16 || h2 == 16)) {
+          throw std::invalid_argument("invalid percent encode sequence");
+        }
+        out.append(&*last, p - last);
+        out.push_back((h1 << 4) | h2);
+        p += 3;
+        last = p;
+        break;
+      }
+    case '+':
+      if (mode == UriEscapeMode::QUERY) {
+        out.append(&*last, p - last);
+        out.push_back(' ');
+        ++p;
+        last = p;
+        break;
+      }
+      // else fallthrough
+    default:
+      ++p;
+      break;
+    }
+  }
+  out.append(&*last, p - last);
+}
+
+namespace detail {
 
 /*
  * The following functions are type-overloaded helpers for
@@ -210,7 +299,7 @@ template<> struct OutputConverter<StringPiece> {
 template<class OutStringT, class DelimT, class OutputIterator>
 void internalSplit(DelimT delim, StringPiece sp, OutputIterator out,
     bool ignoreEmpty) {
-  assert(sp.start() != nullptr);
+  assert(sp.empty() || sp.start() != nullptr);
 
   const char* s = sp.start();
   const size_t strSize = sp.size();
@@ -230,9 +319,9 @@ void internalSplit(DelimT delim, StringPiece sp, OutputIterator out,
       ignoreEmpty);
   }
 
-  int tokenStartPos = 0;
-  int tokenSize = 0;
-  for (int i = 0; i <= strSize - dSize; ++i) {
+  size_t tokenStartPos = 0;
+  size_t tokenSize = 0;
+  for (size_t i = 0; i <= strSize - dSize; ++i) {
     if (atDelim(&s[i], delim)) {
       if (!ignoreEmpty || tokenSize > 0) {
         *out++ = conv(StringPiece(&s[tokenStartPos], tokenSize));
@@ -245,9 +334,8 @@ void internalSplit(DelimT delim, StringPiece sp, OutputIterator out,
       ++tokenSize;
     }
   }
-
+  tokenSize = strSize - tokenStartPos;
   if (!ignoreEmpty || tokenSize > 0) {
-    tokenSize = strSize - tokenStartPos;
     *out++ = conv(StringPiece(&s[tokenStartPos], tokenSize));
   }
 }
@@ -256,6 +344,50 @@ template<class String> StringPiece prepareDelim(const String& s) {
   return StringPiece(s);
 }
 inline char prepareDelim(char c) { return c; }
+
+template <class Dst>
+struct convertTo {
+  template <class Src>
+  static Dst from(const Src& src) { return folly::to<Dst>(src); }
+  static Dst from(const Dst& src) { return src; }
+};
+
+template<bool exact,
+         class Delim,
+         class OutputType>
+typename std::enable_if<IsSplitTargetType<OutputType>::value, bool>::type
+splitFixed(const Delim& delimiter,
+           StringPiece input,
+           OutputType& out) {
+  if (exact && UNLIKELY(std::string::npos != input.find(delimiter))) {
+    return false;
+  }
+  out = convertTo<OutputType>::from(input);
+  return true;
+}
+
+template<bool exact,
+         class Delim,
+         class OutputType,
+         class... OutputTypes>
+typename std::enable_if<IsSplitTargetType<OutputType>::value, bool>::type
+splitFixed(const Delim& delimiter,
+           StringPiece input,
+           OutputType& outHead,
+           OutputTypes&... outTail) {
+  size_t cut = input.find(delimiter);
+  if (UNLIKELY(cut == std::string::npos)) {
+    return false;
+  }
+  StringPiece head(input.begin(), input.begin() + cut);
+  StringPiece tail(input.begin() + cut + detail::delimSize(delimiter),
+                   input.end());
+  if (LIKELY(splitFixed<exact>(delimiter, tail, outTail...))) {
+    outHead = convertTo<OutputType>::from(head);
+    return true;
+  }
+  return false;
+}
 
 }
 
@@ -277,7 +409,7 @@ template<class Delim, class String, class OutputType>
 void split(const Delim& delimiter,
            const String& input,
            fbvector<OutputType>& out,
-           bool ignoreEmpty = false) {
+           bool ignoreEmpty) {
   detail::internalSplit<OutputType>(
     detail::prepareDelim(delimiter),
     StringPiece(input),
@@ -296,6 +428,225 @@ void splitTo(const Delim& delimiter,
     StringPiece(input),
     out,
     ignoreEmpty);
+}
+
+template<bool exact,
+         class Delim,
+         class OutputType,
+         class... OutputTypes>
+typename std::enable_if<IsSplitTargetType<OutputType>::value, bool>::type
+split(const Delim& delimiter,
+      StringPiece input,
+      OutputType& outHead,
+      OutputTypes&... outTail) {
+  return detail::splitFixed<exact>(
+    detail::prepareDelim(delimiter),
+    input,
+    outHead,
+    outTail...);
+}
+
+namespace detail {
+
+/*
+ * If a type can have its string size determined cheaply, we can more
+ * efficiently append it in a loop (see internalJoinAppend). Note that the
+ * struct need not conform to the std::string api completely (ex. does not need
+ * to implement append()).
+ */
+template <class T> struct IsSizableString {
+  enum { value = IsSomeString<T>::value
+         || std::is_same<T, StringPiece>::value };
+};
+
+template <class Iterator>
+struct IsSizableStringContainerIterator :
+  IsSizableString<typename std::iterator_traits<Iterator>::value_type> {
+};
+
+template <class Delim, class Iterator, class String>
+void internalJoinAppend(Delim delimiter,
+                        Iterator begin,
+                        Iterator end,
+                        String& output) {
+  assert(begin != end);
+  if (std::is_same<Delim, StringPiece>::value &&
+      delimSize(delimiter) == 1) {
+    internalJoinAppend(delimFront(delimiter), begin, end, output);
+    return;
+  }
+  toAppend(*begin, &output);
+  while (++begin != end) {
+    toAppend(delimiter, *begin, &output);
+  }
+}
+
+template <class Delim, class Iterator, class String>
+typename std::enable_if<IsSizableStringContainerIterator<Iterator>::value>::type
+internalJoin(Delim delimiter,
+             Iterator begin,
+             Iterator end,
+             String& output) {
+  output.clear();
+  if (begin == end) {
+    return;
+  }
+  const size_t dsize = delimSize(delimiter);
+  Iterator it = begin;
+  size_t size = it->size();
+  while (++it != end) {
+    size += dsize + it->size();
+  }
+  output.reserve(size);
+  internalJoinAppend(delimiter, begin, end, output);
+}
+
+template <class Delim, class Iterator, class String>
+typename
+std::enable_if<!IsSizableStringContainerIterator<Iterator>::value>::type
+internalJoin(Delim delimiter,
+             Iterator begin,
+             Iterator end,
+             String& output) {
+  output.clear();
+  if (begin == end) {
+    return;
+  }
+  internalJoinAppend(delimiter, begin, end, output);
+}
+
+}  // namespace detail
+
+template <class Delim, class Iterator, class String>
+void join(const Delim& delimiter,
+          Iterator begin,
+          Iterator end,
+          String& output) {
+  detail::internalJoin(
+    detail::prepareDelim(delimiter),
+    begin,
+    end,
+    output);
+}
+
+template <class String1, class String2>
+void backslashify(const String1& input, String2& output, bool hex_style) {
+  static const char hexValues[] = "0123456789abcdef";
+  output.clear();
+  output.reserve(3 * input.size());
+  for (unsigned char c : input) {
+    // less than space or greater than '~' are considered unprintable
+    if (c < 0x20 || c > 0x7e || c == '\\') {
+      bool hex_append = false;
+      output.push_back('\\');
+      if (hex_style) {
+        hex_append = true;
+      } else {
+        if (c == '\r') output += 'r';
+        else if (c == '\n') output += 'n';
+        else if (c == '\t') output += 't';
+        else if (c == '\a') output += 'a';
+        else if (c == '\b') output += 'b';
+        else if (c == '\0') output += '0';
+        else if (c == '\\') output += '\\';
+        else {
+          hex_append = true;
+        }
+      }
+      if (hex_append) {
+        output.push_back('x');
+        output.push_back(hexValues[(c >> 4) & 0xf]);
+        output.push_back(hexValues[c & 0xf]);
+      }
+    } else {
+      output += c;
+    }
+  }
+}
+
+template <class String1, class String2>
+void humanify(const String1& input, String2& output) {
+  size_t numUnprintable = 0;
+  size_t numPrintablePrefix = 0;
+  for (unsigned char c : input) {
+    if (c < 0x20 || c > 0x7e || c == '\\') {
+      ++numUnprintable;
+    }
+    if (numUnprintable == 0) {
+      ++numPrintablePrefix;
+    }
+  }
+
+  // hexlify doubles a string's size; backslashify can potentially
+  // explode it by 4x.  Now, the printable range of the ascii
+  // "spectrum" is around 95 out of 256 values, so a "random" binary
+  // string should be around 60% unprintable.  We use a 50% hueristic
+  // here, so if a string is 60% unprintable, then we just use hex
+  // output.  Otherwise we backslash.
+  //
+  // UTF8 is completely ignored; as a result, utf8 characters will
+  // likely be \x escaped (since most common glyphs fit in two bytes).
+  // This is a tradeoff of complexity/speed instead of a convenience
+  // that likely would rarely matter.  Moreover, this function is more
+  // about displaying underlying bytes, not about displaying glyphs
+  // from languages.
+  if (numUnprintable == 0) {
+    output = input;
+  } else if (5 * numUnprintable >= 3 * input.size()) {
+    // However!  If we have a "meaningful" prefix of printable
+    // characters, say 20% of the string, we backslashify under the
+    // assumption viewing the prefix as ascii is worth blowing the
+    // output size up a bit.
+    if (5 * numPrintablePrefix >= input.size()) {
+      backslashify(input, output);
+    } else {
+      output = "0x";
+      hexlify(input, output, true /* append output */);
+    }
+  } else {
+    backslashify(input, output);
+  }
+}
+
+template<class InputString, class OutputString>
+bool hexlify(const InputString& input, OutputString& output,
+             bool append_output) {
+  if (!append_output) output.clear();
+
+  static char hexValues[] = "0123456789abcdef";
+  auto j = output.size();
+  output.resize(2 * input.size() + output.size());
+  for (size_t i = 0; i < input.size(); ++i) {
+    int ch = input[i];
+    output[j++] = hexValues[(ch >> 4) & 0xf];
+    output[j++] = hexValues[ch & 0xf];
+  }
+  return true;
+}
+
+template<class InputString, class OutputString>
+bool unhexlify(const InputString& input, OutputString& output) {
+  if (input.size() % 2 != 0) {
+    return false;
+  }
+  output.resize(input.size() / 2);
+  int j = 0;
+  auto unhex = [](char c) -> int {
+    return c >= '0' && c <= '9' ? c - '0' :
+           c >= 'A' && c <= 'F' ? c - 'A' + 10 :
+           c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+           -1;
+  };
+
+  for (size_t i = 0; i < input.size(); i += 2) {
+    int highBits = unhex(input[i]);
+    int lowBits = unhex(input[i + 1]);
+    if (highBits < 0 || lowBits < 0) {
+      return false;
+    }
+    output[j++] = (highBits << 4) + lowBits;
+  }
+  return true;
 }
 
 namespace detail {
@@ -320,4 +671,3 @@ void hexDump(const void* ptr, size_t size, OutIt out) {
 }  // namespace folly
 
 #endif /* FOLLY_STRING_INL_H_ */
-

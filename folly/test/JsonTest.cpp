@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,15 +13,13 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#include "folly/json.h"
-#include <gtest/gtest.h>
-#include <gflags/gflags.h>
-#include <cmath>
 #include <limits>
-#include <iostream>
+#include <strstream>
+
 #include <boost/next_prior.hpp>
-#include "folly/Benchmark.h"
+#include <folly/json.h>
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
 
 using folly::dynamic;
 using folly::parseJson;
@@ -75,9 +73,14 @@ TEST(Json, Parse) {
   EXPECT_EQ(-std::numeric_limits<double>::infinity(),
             parseJson("-Infinity").asDouble());
   EXPECT_TRUE(std::isnan(parseJson("NaN").asDouble()));
+
+  // case matters
   EXPECT_THROW(parseJson("infinity"), std::runtime_error);
   EXPECT_THROW(parseJson("inf"), std::runtime_error);
+  EXPECT_THROW(parseJson("Inf"), std::runtime_error);
+  EXPECT_THROW(parseJson("INF"), std::runtime_error);
   EXPECT_THROW(parseJson("nan"), std::runtime_error);
+  EXPECT_THROW(parseJson("NAN"), std::runtime_error);
 
   auto array = parseJson(
     "[12,false, false  , null , [12e4,32, [], 12]]");
@@ -86,32 +89,16 @@ TEST(Json, Parse) {
     EXPECT_EQ(boost::prior(array.end())->size(), 4);
   }
 
-  bool caught = false;
-  try {
-    parseJson("\n[12,\n\nnotvalidjson");
-  } catch (const std::exception& e) {
-    caught = true;
-  }
-  EXPECT_TRUE(caught);
+  EXPECT_THROW(parseJson("\n[12,\n\nnotvalidjson"),
+               std::runtime_error);
 
-  caught = false;
-  try {
-    parseJson("12e2e2");
-  } catch (const std::exception& e) {
-    caught = true;
-  }
-  EXPECT_TRUE(caught);
+  EXPECT_THROW(parseJson("12e2e2"),
+               std::runtime_error);
 
-  caught = false;
-  try {
-    parseJson("{\"foo\":12,\"bar\":42} \"something\"");
-  } catch (const std::exception& e) {
-    // incomplete parse
-    caught = true;
-  }
-  EXPECT_TRUE(caught);
+  EXPECT_THROW(parseJson("{\"foo\":12,\"bar\":42} \"something\""),
+               std::runtime_error);
 
-  dynamic anotherVal = dynamic::object
+  dynamic value = dynamic::object
     ("foo", "bar")
     ("junk", 12)
     ("another", 32.2)
@@ -128,17 +115,43 @@ TEST(Json, Parse) {
     ;
 
   // Print then parse and get the same thing, hopefully.
-  auto value = parseJson(toJson(anotherVal));
-  EXPECT_EQ(value, anotherVal);
+  EXPECT_EQ(value, parseJson(toJson(value)));
+
 
   // Test an object with non-string values.
-  dynamic something = folly::parseJson(
+  dynamic something = parseJson(
     "{\"old_value\":40,\"changed\":true,\"opened\":false}");
   dynamic expected = dynamic::object
     ("old_value", 40)
     ("changed", true)
     ("opened", false);
   EXPECT_EQ(something, expected);
+}
+
+TEST(Json, ParseTrailingComma) {
+  folly::json::serialization_opts on, off;
+  on.allow_trailing_comma = true;
+  off.allow_trailing_comma = false;
+
+  dynamic arr { 1, 2 };
+  EXPECT_EQ(arr, parseJson("[1, 2]", on));
+  EXPECT_EQ(arr, parseJson("[1, 2,]", on));
+  EXPECT_EQ(arr, parseJson("[1, 2, ]", on));
+  EXPECT_EQ(arr, parseJson("[1, 2 , ]", on));
+  EXPECT_EQ(arr, parseJson("[1, 2 ,]", on));
+  EXPECT_THROW(parseJson("[1, 2,]", off), std::runtime_error);
+
+  dynamic obj = dynamic::object("a", 1);
+  EXPECT_EQ(obj, parseJson("{\"a\": 1}", on));
+  EXPECT_EQ(obj, parseJson("{\"a\": 1,}", on));
+  EXPECT_EQ(obj, parseJson("{\"a\": 1, }", on));
+  EXPECT_EQ(obj, parseJson("{\"a\": 1 , }", on));
+  EXPECT_EQ(obj, parseJson("{\"a\": 1 ,}", on));
+  EXPECT_THROW(parseJson("{\"a\":1,}", off), std::runtime_error);
+}
+
+TEST(Json, BoolConversion) {
+  EXPECT_TRUE(parseJson("42").asBool());
 }
 
 TEST(Json, JavascriptSafe) {
@@ -160,17 +173,24 @@ TEST(Json, Produce) {
   value = parseJson("\"Control code: \001 \002 \x1f\"");
   EXPECT_EQ(toJson(value), R"("Control code: \u0001 \u0002 \u001f")");
 
-  bool caught = false;
-  try {
-    dynamic d = dynamic::object;
-    d["abc"] = "xyz";
-    d[42.33] = "asd";
-    auto str = toJson(d);
-  } catch (std::exception const& e) {
-    // We're not allowed to have non-string keys in json.
-    caught = true;
-  }
-  EXPECT_TRUE(caught);
+  // We're not allowed to have non-string keys in json.
+  EXPECT_THROW(toJson(dynamic::object("abc", "xyz")(42.33, "asd")),
+               std::runtime_error);
+
+  // Check Infinity/Nan
+  folly::json::serialization_opts opts;
+  opts.allow_nan_inf = true;
+  EXPECT_EQ("Infinity",
+            folly::json::serialize(parseJson("Infinity"), opts).toStdString());
+  EXPECT_EQ("NaN",
+            folly::json::serialize(parseJson("NaN"), opts).toStdString());
+}
+
+TEST(Json, JsonEscape) {
+  folly::json::serialization_opts opts;
+  EXPECT_EQ(
+    folly::json::serialize("\b\f\n\r\x01\t\\\"/\v\a", opts),
+    R"("\b\f\n\r\u0001\t\\\"/\u000b\u0007")");
 }
 
 TEST(Json, JsonNonAsciiEncoding) {
@@ -239,117 +259,271 @@ TEST(Json, JsonNonAsciiEncoding) {
   EXPECT_ANY_THROW(folly::json::serialize("\xed\xaf\xbf\xed\xbf\xbf", opts));
 }
 
-TEST(Json, UTF8Validation) {
+TEST(Json, UTF8Retention) {
+
+  // test retention with valid utf8 strings
+  folly::fbstring input = "\u2665";
+  folly::fbstring jsonInput = folly::toJson(input);
+  folly::fbstring output = folly::parseJson(jsonInput).asString();
+  folly::fbstring jsonOutput = folly::toJson(output);
+
+  EXPECT_EQ(input, output);
+  EXPECT_EQ(jsonInput, jsonOutput);
+
+  // test retention with invalid utf8 - note that non-ascii chars are retained
+  // as is, and no unicode encoding is attempted so no exception is thrown.
+  EXPECT_EQ(
+    folly::toJson("a\xe0\xa0\x80z\xc0\x80"),
+    "\"a\xe0\xa0\x80z\xc0\x80\""
+  );
+}
+
+TEST(Json, UTF8EncodeNonAsciiRetention) {
+
   folly::json::serialization_opts opts;
-  opts.validate_utf8 = true;
+  opts.encode_non_ascii = true;
 
-  // valid utf8 strings
-  EXPECT_EQ(folly::json::serialize("a\xc2\x80z", opts), R"("a\u00c2\u0080z")");
-  EXPECT_EQ(
-    folly::json::serialize("a\xe0\xa0\x80z", opts),
-    R"("a\u00e0\u00a0\u0080z")");
-  EXPECT_EQ(
-    folly::json::serialize("a\xe0\xa0\x80m\xc2\x80z", opts),
-    R"("a\u00e0\u00a0\u0080m\u00c2\u0080z")");
+  // test encode_non_ascii valid utf8 strings
+  folly::fbstring input = "\u2665";
+  folly::fbstring jsonInput = folly::json::serialize(input, opts);
+  folly::fbstring output = folly::parseJson(jsonInput).asString();
+  folly::fbstring jsonOutput = folly::json::serialize(output, opts);
 
-  // test with invalid utf8
+  EXPECT_EQ(input, output);
+  EXPECT_EQ(jsonInput, jsonOutput);
+
+  // test encode_non_ascii with invalid utf8 - note that an attempt to encode
+  // non-ascii to unicode will result is a utf8 validation and throw exceptions.
   EXPECT_ANY_THROW(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80", opts));
   EXPECT_ANY_THROW(folly::json::serialize("a\xe0\xa0\x80z\xe0\x80\x80", opts));
 }
 
-BENCHMARK(jsonSerialize, iters) {
-  folly::json::serialization_opts opts;
-  for (int i = 0; i < iters; ++i) {
-    folly::json::serialize(
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy",
-      opts);
-  }
-}
-
-BENCHMARK(jsonSerializeWithNonAsciiEncoding, iters) {
-  folly::json::serialization_opts opts;
-  opts.encode_non_ascii = true;
-
-  for (int i = 0; i < iters; ++i) {
-    folly::json::serialize(
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy",
-      opts);
-  }
-}
-
-BENCHMARK(jsonSerializeWithUtf8Validation, iters) {
+TEST(Json, UTF8Validation) {
   folly::json::serialization_opts opts;
   opts.validate_utf8 = true;
 
-  for (int i = 0; i < iters; ++i) {
-    folly::json::serialize(
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy"
-      "qwerty \xc2\x80 \xef\xbf\xbf poiuy",
-      opts);
-  }
+  // test validate_utf8 valid utf8 strings - note that we only validate the
+  // for utf8 but don't encode non-ascii to unicode so they are retained as is.
+  EXPECT_EQ(folly::json::serialize("a\xc2\x80z", opts), "\"a\xc2\x80z\"");
+  EXPECT_EQ(
+    folly::json::serialize("a\xe0\xa0\x80z", opts),
+    "\"a\xe0\xa0\x80z\"");
+  EXPECT_EQ(
+    folly::json::serialize("a\xe0\xa0\x80m\xc2\x80z", opts),
+    "\"a\xe0\xa0\x80m\xc2\x80z\"");
+
+  // test validate_utf8 with invalid utf8
+  EXPECT_ANY_THROW(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80", opts));
+  EXPECT_ANY_THROW(folly::json::serialize("a\xe0\xa0\x80z\xe0\x80\x80", opts));
+
+  opts.skip_invalid_utf8 = true;
+  EXPECT_EQ(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80", opts),
+            "\"a\xe0\xa0\x80z\ufffd\ufffd\"");
+  EXPECT_EQ(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80\x80", opts),
+            "\"a\xe0\xa0\x80z\ufffd\ufffd\ufffd\"");
+  EXPECT_EQ(folly::json::serialize("z\xc0\x80z\xe0\xa0\x80", opts),
+            "\"z\ufffd\ufffdz\xe0\xa0\x80\"");
+
+  opts.encode_non_ascii = true;
+  EXPECT_EQ(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80", opts),
+            "\"a\\u0800z\\ufffd\\ufffd\"");
+  EXPECT_EQ(folly::json::serialize("a\xe0\xa0\x80z\xc0\x80\x80", opts),
+            "\"a\\u0800z\\ufffd\\ufffd\\ufffd\"");
+  EXPECT_EQ(folly::json::serialize("z\xc0\x80z\xe0\xa0\x80", opts),
+            "\"z\\ufffd\\ufffdz\\u0800\"");
+
 }
 
-BENCHMARK(parseSmallStringWithUtf, iters) {
-  for (int i = 0; i < iters << 4; ++i) {
-    parseJson("\"I \\u2665 UTF-8 thjasdhkjh blah blah blah\"");
-  }
+
+TEST(Json, ParseNonStringKeys) {
+  // test string keys
+  EXPECT_EQ("a", parseJson("{\"a\":[]}").items().begin()->first.asString());
+
+  // check that we don't allow non-string keys as this violates the
+  // strict JSON spec (though it is emitted by the output of
+  // folly::dynamic with operator <<).
+  EXPECT_THROW(parseJson("{1:[]}"), std::runtime_error);
+
+  // check that we can parse colloquial JSON if the option is set
+  folly::json::serialization_opts opts;
+  opts.allow_non_string_keys = true;
+
+  auto val = parseJson("{1:[]}", opts);
+  EXPECT_EQ(1, val.items().begin()->first.asInt());
+
+
+  // test we can still read in strings
+  auto sval = parseJson("{\"a\":[]}", opts);
+  EXPECT_EQ("a", sval.items().begin()->first.asString());
+
+  // test we can read in doubles
+  auto dval = parseJson("{1.5:[]}", opts);
+  EXPECT_EQ(1.5, dval.items().begin()->first.asDouble());
 }
 
-BENCHMARK(parseNormalString, iters) {
-  for (int i = 0; i < iters << 4; ++i) {
-    parseJson("\"akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk\"");
-  }
+TEST(Json, ParseDoubleFallback) {
+  // default behavior
+  EXPECT_THROW(parseJson("{\"a\":847605071342477600000000000000}"),
+      std::range_error);
+  EXPECT_THROW(parseJson("{\"a\":-9223372036854775809}"),
+      std::range_error);
+  EXPECT_THROW(parseJson("{\"a\":9223372036854775808}"),
+      std::range_error);
+  EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+      parseJson("{\"a\":-9223372036854775808}").items().begin()
+        ->second.asInt());
+  EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+      parseJson("{\"a\":9223372036854775807}").items().begin()->second.asInt());
+  // with double_fallback
+  folly::json::serialization_opts opts;
+  opts.double_fallback = true;
+  EXPECT_EQ(847605071342477600000000000000.0,
+      parseJson("{\"a\":847605071342477600000000000000}",
+        opts).items().begin()->second.asDouble());
+  EXPECT_EQ(847605071342477600000000000000.0,
+      parseJson("{\"a\": 847605071342477600000000000000}",
+        opts).items().begin()->second.asDouble());
+  EXPECT_EQ(847605071342477600000000000000.0,
+      parseJson("{\"a\":847605071342477600000000000000 }",
+        opts).items().begin()->second.asDouble());
+  EXPECT_EQ(847605071342477600000000000000.0,
+      parseJson("{\"a\": 847605071342477600000000000000 }",
+        opts).items().begin()->second.asDouble());
+  EXPECT_EQ(std::numeric_limits<int64_t>::min(),
+      parseJson("{\"a\":-9223372036854775808}",
+        opts).items().begin()->second.asInt());
+  EXPECT_EQ(std::numeric_limits<int64_t>::max(),
+      parseJson("{\"a\":9223372036854775807}",
+        opts).items().begin()->second.asInt());
+  // show that some precision gets lost
+  EXPECT_EQ(847605071342477612345678900000.0,
+      parseJson("{\"a\":847605071342477612345678912345}",
+        opts).items().begin()->second.asDouble());
 }
 
-BENCHMARK(parseBigString, iters) {
-  for (int i = 0; i < iters; ++i) {
-    parseJson("\""
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "akjhfk jhkjlakjhfk jhkjlakjhfk jhkjl akjhfk"
-      "\"");
-  }
+TEST(Json, ParseNumbersAsStrings) {
+  folly::json::serialization_opts opts;
+  opts.parse_numbers_as_strings = true;
+  auto parse = [&](folly::fbstring number) {
+    return parseJson(number, opts).asString();
+  };
+
+  EXPECT_EQ("0", parse("0"));
+  EXPECT_EQ("1234", parse("1234"));
+  EXPECT_EQ("3.00", parse("3.00"));
+  EXPECT_EQ("3.14", parse("3.14"));
+  EXPECT_EQ("0.1234", parse("0.1234"));
+  EXPECT_EQ("0.0", parse("0.0"));
+  EXPECT_EQ("46845131213548676854213265486468451312135486768542132",
+      parse("46845131213548676854213265486468451312135486768542132"));
+  EXPECT_EQ("-468451312135486768542132654864684513121354867685.5e4",
+      parse("-468451312135486768542132654864684513121354867685.5e4"));
+  EXPECT_EQ("6.62607004e-34", parse("6.62607004e-34"));
+  EXPECT_EQ("6.62607004E+34", parse("6.62607004E+34"));
+  EXPECT_EQ("Infinity", parse("Infinity"));
+  EXPECT_EQ("-Infinity", parse("-Infinity"));
+  EXPECT_EQ("NaN", parse("NaN"));
+
+  EXPECT_THROW(parse("ThisIsWrong"), std::runtime_error);
+  EXPECT_THROW(parse("34-2"), std::runtime_error);
+  EXPECT_THROW(parse(""), std::runtime_error);
+  EXPECT_THROW(parse("-"), std::runtime_error);
+  EXPECT_THROW(parse("34-e2"), std::runtime_error);
+  EXPECT_THROW(parse("34e2.4"), std::runtime_error);
+  EXPECT_THROW(parse("infinity"), std::runtime_error);
+  EXPECT_THROW(parse("nan"), std::runtime_error);
+}
+
+TEST(Json, SortKeys) {
+  folly::json::serialization_opts opts_on, opts_off;
+  opts_on.sort_keys = true;
+  opts_off.sort_keys = false;
+
+  dynamic value = dynamic::object
+    ("foo", "bar")
+    ("junk", 12)
+    ("another", 32.2)
+    ("a",
+      {
+        dynamic::object("a", "b")
+                       ("c", "d"),
+        12.5,
+        "Yo Dawg",
+        { "heh" },
+        nullptr
+      }
+    )
+    ;
+
+  std::string sorted_keys =
+    R"({"a":[{"a":"b","c":"d"},12.5,"Yo Dawg",["heh"],null],)"
+    R"("another":32.2,"foo":"bar","junk":12})";
+
+  EXPECT_EQ(value, parseJson(folly::json::serialize(value, opts_on)));
+  EXPECT_EQ(value, parseJson(folly::json::serialize(value, opts_off)));
+
+  EXPECT_EQ(sorted_keys, folly::json::serialize(value, opts_on));
+}
+
+TEST(Json, PrintTo) {
+  std::ostrstream oss;
+
+  dynamic value = dynamic::object
+    ("foo", "bar")
+    ("junk", 12)
+    ("another", 32.2)
+    (true, false) // include non-string keys
+    (false, true)
+    (2, 3)
+    (0, 1)
+    (1, 2)
+    (1.5, 2.25)
+    (0.5, 0.25)
+    (0, 1)
+    (1, 2)
+    ("a",
+      {
+        dynamic::object("a", "b")
+                       ("c", "d"),
+        12.5,
+        "Yo Dawg",
+        { "heh" },
+        nullptr
+      }
+    )
+    ;
+
+  std::string expected =
+      R"({
+  false : true,
+  true : false,
+  0.5 : 0.25,
+  1.5 : 2.25,
+  0 : 1,
+  1 : 2,
+  2 : 3,
+  "a" : [
+    {
+      "a" : "b",
+      "c" : "d"
+    },
+    12.5,
+    "Yo Dawg",
+    [
+      "heh"
+    ],
+    null
+  ],
+  "another" : 32.2,
+  "foo" : "bar",
+  "junk" : 12
+})";
+  PrintTo(value, &oss);
+  EXPECT_EQ(expected, oss.str());
 }
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  if (FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
   return RUN_ALL_TESTS();
 }

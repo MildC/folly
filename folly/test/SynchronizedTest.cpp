@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,89 +18,213 @@
 
 // Test bed for folly/Synchronized.h
 
-#include "folly/Synchronized.h"
-#include "folly/RWSpinLock.h"
-#include "folly/test/SynchronizedTestLib.h"
+#include <folly/Synchronized.h>
+#include <folly/RWSpinLock.h>
+#include <folly/SharedMutex.h>
+#include <folly/test/SynchronizedTestLib.h>
 #include <gtest/gtest.h>
 
+namespace {
 
-TEST(Synchronized, Basic) {
-  testBasic<std::mutex>();
-  testBasic<std::recursive_mutex>();
-  testBasic<std::timed_mutex>();
-  testBasic<std::recursive_timed_mutex>();
+template <class Mutex>
+class SynchronizedTest : public testing::Test {};
 
-  testBasic<folly::RWTicketSpinLock32>();
+using SynchronizedTestTypes = testing::Types
+  < folly::SharedMutexReadPriority
+  , folly::SharedMutexWritePriority
+  , std::mutex
+  , std::recursive_mutex
+#ifdef FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+  , std::timed_mutex
+  , std::recursive_timed_mutex
+#endif
+  , boost::mutex
+  , boost::recursive_mutex
+#ifdef FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+  , boost::timed_mutex
+  , boost::recursive_timed_mutex
+#endif
+  , boost::shared_mutex
+#ifdef RW_SPINLOCK_USE_X86_INTRINSIC_
+  , folly::RWTicketSpinLock32
+  , folly::RWTicketSpinLock64
+#endif
+  >;
+TYPED_TEST_CASE(SynchronizedTest, SynchronizedTestTypes);
 
-  testBasic<boost::mutex>();
-  testBasic<boost::recursive_mutex>();
-  testBasic<boost::shared_mutex>();
-  testBasic<boost::timed_mutex>();
-  testBasic<boost::recursive_timed_mutex>();
+TYPED_TEST(SynchronizedTest, Basic) {
+  testBasic<TypeParam>();
 }
 
-TEST(Synchronized, Concurrency) {
-  testConcurrency<std::mutex>();
-  testConcurrency<std::recursive_mutex>();
-  testConcurrency<std::timed_mutex>();
-  testConcurrency<std::recursive_timed_mutex>();
-
-  testConcurrency<folly::RWTicketSpinLock32>();
-
-  testConcurrency<boost::mutex>();
-  testConcurrency<boost::recursive_mutex>();
-  testConcurrency<boost::shared_mutex>();
-  testConcurrency<boost::timed_mutex>();
-  testConcurrency<boost::recursive_timed_mutex>();
+TYPED_TEST(SynchronizedTest, Concurrency) {
+  testConcurrency<TypeParam>();
 }
 
-
-TEST(Synchronized, DualLocking) {
-  testDualLocking<std::mutex>();
-  testDualLocking<std::recursive_mutex>();
-  testDualLocking<std::timed_mutex>();
-  testDualLocking<std::recursive_timed_mutex>();
-
-  testDualLocking<folly::RWTicketSpinLock32>();
-
-  testDualLocking<boost::mutex>();
-  testDualLocking<boost::recursive_mutex>();
-  testDualLocking<boost::shared_mutex>();
-  testDualLocking<boost::timed_mutex>();
-  testDualLocking<boost::recursive_timed_mutex>();
+TYPED_TEST(SynchronizedTest, DualLocking) {
+  testDualLocking<TypeParam>();
 }
 
-
-TEST(Synchronized, DualLockingWithConst) {
-  testDualLockingWithConst<std::mutex>();
-  testDualLockingWithConst<std::recursive_mutex>();
-  testDualLockingWithConst<std::timed_mutex>();
-  testDualLockingWithConst<std::recursive_timed_mutex>();
-
-  testDualLockingWithConst<folly::RWTicketSpinLock32>();
-
-  testDualLockingWithConst<boost::mutex>();
-  testDualLockingWithConst<boost::recursive_mutex>();
-  testDualLockingWithConst<boost::shared_mutex>();
-  testDualLockingWithConst<boost::timed_mutex>();
-  testDualLockingWithConst<boost::recursive_timed_mutex>();
+TYPED_TEST(SynchronizedTest, DualLockingWithConst) {
+  testDualLockingWithConst<TypeParam>();
 }
 
-
-TEST(Synchronized, TimedSynchronized) {
-  testTimedSynchronized<std::timed_mutex>();
-  testTimedSynchronized<std::recursive_timed_mutex>();
-
-  testTimedSynchronized<boost::timed_mutex>();
-  testTimedSynchronized<boost::recursive_timed_mutex>();
-  testTimedSynchronized<boost::shared_mutex>();
+TYPED_TEST(SynchronizedTest, ConstCopy) {
+  testConstCopy<TypeParam>();
 }
 
-TEST(Synchronized, ConstCopy) {
-  testConstCopy<std::timed_mutex>();
-  testConstCopy<std::recursive_timed_mutex>();
+template <class Mutex>
+class SynchronizedTimedTest : public testing::Test {};
 
-  testConstCopy<boost::timed_mutex>();
-  testConstCopy<boost::recursive_timed_mutex>();
-  testConstCopy<boost::shared_mutex>();
+using SynchronizedTimedTestTypes = testing::Types
+  < folly::SharedMutexReadPriority
+  , folly::SharedMutexWritePriority
+#ifdef FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+  , std::timed_mutex
+  , std::recursive_timed_mutex
+  , boost::timed_mutex
+  , boost::recursive_timed_mutex
+  , boost::shared_mutex
+#endif
+#ifdef RW_SPINLOCK_USE_X86_INTRINSIC_
+  , folly::RWTicketSpinLock32
+  , folly::RWTicketSpinLock64
+#endif
+  >;
+TYPED_TEST_CASE(SynchronizedTimedTest, SynchronizedTimedTestTypes);
+
+TYPED_TEST(SynchronizedTimedTest, TimedSynchronized) {
+  testTimedSynchronized<TypeParam>();
+}
+
+template <class Mutex>
+class SynchronizedTimedWithConstTest : public testing::Test {};
+
+using SynchronizedTimedWithConstTestTypes = testing::Types
+  < folly::SharedMutexReadPriority
+  , folly::SharedMutexWritePriority
+#ifdef FOLLY_SYNCHRONIZED_HAVE_TIMED_MUTEXES
+  , boost::shared_mutex
+#endif
+#ifdef RW_SPINLOCK_USE_X86_INTRINSIC_
+  , folly::RWTicketSpinLock32
+  , folly::RWTicketSpinLock64
+#endif
+  >;
+TYPED_TEST_CASE(
+    SynchronizedTimedWithConstTest, SynchronizedTimedWithConstTestTypes);
+
+TYPED_TEST(SynchronizedTimedWithConstTest, TimedSynchronizeWithConst) {
+  testTimedSynchronizedWithConst<TypeParam>();
+}
+
+TYPED_TEST(SynchronizedTest, InPlaceConstruction) {
+  testInPlaceConstruction<TypeParam>();
+}
+
+using CountPair = std::pair<int, int>;
+// This class is specialized only to be uesed in SynchronizedLockTest
+class FakeMutex {
+ public:
+  bool lock() {
+    ++lockCount_;
+    return true;
+  }
+
+  bool unlock() {
+    ++unlockCount_;
+    return true;
+  }
+
+  static CountPair getLockUnlockCount() {
+    return CountPair{lockCount_, unlockCount_};
+  }
+
+  static void resetLockUnlockCount() {
+    lockCount_ = 0;
+    unlockCount_ = 0;
+  }
+ private:
+  // Keep these two static for test access
+  // Keep them thread_local in case of tests are run in parallel within one
+  // process
+  static thread_local int lockCount_;
+  static thread_local int unlockCount_;
+
+  // Adapters for Synchronized<>
+  friend void acquireReadWrite(FakeMutex& lock) { lock.lock(); }
+  friend void releaseReadWrite(FakeMutex& lock) { lock.unlock(); }
+};
+thread_local int FakeMutex::lockCount_{0};
+thread_local int FakeMutex::unlockCount_{0};
+
+// SynchronizedLockTest is used to verify the correct lock unlock behavior
+// happens per design
+class SynchronizedLockTest : public testing::Test {
+ public:
+  void SetUp() override {
+    FakeMutex::resetLockUnlockCount();
+  }
+};
+
+// Single level of SYNCHRONIZED and UNSYNCHRONIZED, although nested test are
+// super set of it, it is possible single level test passes while nested tests
+// fail
+TEST_F(SynchronizedLockTest, SyncUnSync) {
+  folly::Synchronized<std::vector<int>, FakeMutex> obj;
+  EXPECT_EQ((CountPair{0, 0}), FakeMutex::getLockUnlockCount());
+  SYNCHRONIZED(obj) {
+    EXPECT_EQ((CountPair{1, 0}), FakeMutex::getLockUnlockCount());
+    UNSYNCHRONIZED(obj) {
+      EXPECT_EQ((CountPair{1, 1}), FakeMutex::getLockUnlockCount());
+    }
+    EXPECT_EQ((CountPair{2, 1}), FakeMutex::getLockUnlockCount());
+  }
+  EXPECT_EQ((CountPair{2, 2}), FakeMutex::getLockUnlockCount());
+}
+
+// Nested SYNCHRONIZED UNSYNCHRONIZED test, 2 levels for each are used here
+TEST_F(SynchronizedLockTest, NestedSyncUnSync) {
+  folly::Synchronized<std::vector<int>, FakeMutex> obj;
+  EXPECT_EQ((CountPair{0, 0}), FakeMutex::getLockUnlockCount());
+  SYNCHRONIZED(objCopy, obj) {
+    EXPECT_EQ((CountPair{1, 0}), FakeMutex::getLockUnlockCount());
+    SYNCHRONIZED(obj) {
+      EXPECT_EQ((CountPair{2, 0}), FakeMutex::getLockUnlockCount());
+      UNSYNCHRONIZED(obj) {
+        EXPECT_EQ((CountPair{2, 1}), FakeMutex::getLockUnlockCount());
+        UNSYNCHRONIZED(obj) {
+          EXPECT_EQ((CountPair{2, 2}),
+                    FakeMutex::getLockUnlockCount());
+        }
+        EXPECT_EQ((CountPair{3, 2}), FakeMutex::getLockUnlockCount());
+      }
+      EXPECT_EQ((CountPair{4, 2}), FakeMutex::getLockUnlockCount());
+    }
+    EXPECT_EQ((CountPair{4, 3}), FakeMutex::getLockUnlockCount());
+  }
+  EXPECT_EQ((CountPair{4, 4}), FakeMutex::getLockUnlockCount());
+}
+
+// Different nesting behavior, UNSYNCHRONIZED called on differen depth of
+// SYNCHRONIZED
+TEST_F(SynchronizedLockTest, NestedSyncUnSync2) {
+  folly::Synchronized<std::vector<int>, FakeMutex> obj;
+  EXPECT_EQ((CountPair{0, 0}), FakeMutex::getLockUnlockCount());
+  SYNCHRONIZED(objCopy, obj) {
+    EXPECT_EQ((CountPair{1, 0}), FakeMutex::getLockUnlockCount());
+    SYNCHRONIZED(obj) {
+      EXPECT_EQ((CountPair{2, 0}), FakeMutex::getLockUnlockCount());
+      UNSYNCHRONIZED(obj) {
+        EXPECT_EQ((CountPair{2, 1}), FakeMutex::getLockUnlockCount());
+      }
+      EXPECT_EQ((CountPair{3, 1}), FakeMutex::getLockUnlockCount());
+    }
+    EXPECT_EQ((CountPair{3, 2}), FakeMutex::getLockUnlockCount());
+    UNSYNCHRONIZED(obj) {
+      EXPECT_EQ((CountPair{3, 3}), FakeMutex::getLockUnlockCount());
+    }
+    EXPECT_EQ((CountPair{4, 3}), FakeMutex::getLockUnlockCount());
+  }
+  EXPECT_EQ((CountPair{4, 4}), FakeMutex::getLockUnlockCount());
+}
 }

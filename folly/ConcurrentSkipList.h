@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -121,38 +121,39 @@ Sample usage:
 #define FOLLY_CONCURRENT_SKIP_LIST_H_
 
 #include <algorithm>
-#include <climits>
-#include <type_traits>
-#include <utility>
-#include <vector>
 #include <atomic>
-#include <thread>
+#include <limits>
+#include <memory>
+#include <type_traits>
 #include <boost/iterator/iterator_facade.hpp>
-#include <boost/scoped_ptr.hpp>
-#include <boost/shared_ptr.hpp>
-
 #include <glog/logging.h>
-#include "folly/ConcurrentSkipList-inl.h"
-#include "folly/Likely.h"
-#include "folly/SmallLocks.h"
+
+#include <folly/ConcurrentSkipList-inl.h>
+#include <folly/Likely.h>
+#include <folly/Memory.h>
+#include <folly/MicroSpinLock.h>
 
 namespace folly {
 
-template<typename T, typename Comp=std::less<T>, int MAX_HEIGHT=24>
+template<typename T,
+         typename Comp = std::less<T>,
+         // All nodes are allocated using provided SimpleAllocator,
+         // it should be thread-safe.
+         typename NodeAlloc = SysAlloc,
+         int MAX_HEIGHT = 24>
 class ConcurrentSkipList {
   // MAX_HEIGHT needs to be at least 2 to suppress compiler
   // warnings/errors (Werror=uninitialized tiggered due to preds_[1]
   // being treated as a scalar in the compiler).
   static_assert(MAX_HEIGHT >= 2 && MAX_HEIGHT < 64,
       "MAX_HEIGHT can only be in the range of [2, 64)");
-  typedef detail::SkipListNode<T> NodeType;
   typedef std::unique_lock<folly::MicroSpinLock> ScopedLocker;
-  typedef ConcurrentSkipList<T, Comp, MAX_HEIGHT> SkipListType;
+  typedef ConcurrentSkipList<T, Comp, NodeAlloc, MAX_HEIGHT> SkipListType;
 
  public:
+  typedef detail::SkipListNode<T> NodeType;
   typedef T value_type;
   typedef T key_type;
-
 
   typedef detail::csl_iterator<value_type, NodeType> iterator;
   typedef detail::csl_iterator<const value_type, const NodeType> const_iterator;
@@ -160,14 +161,20 @@ class ConcurrentSkipList {
   class Accessor;
   class Skipper;
 
-  // convenient function to get an Accessor to a new instance.
-  static Accessor create(int height=1) {
-    return Accessor(createInstance(height));
+  explicit ConcurrentSkipList(int height, const NodeAlloc& alloc = NodeAlloc())
+    : recycler_(alloc),
+      head_(NodeType::create(recycler_.alloc(), height, value_type(), true)),
+      size_(0) { }
+
+  // Convenient function to get an Accessor to a new instance.
+  static Accessor create(int height = 1, const NodeAlloc& alloc = NodeAlloc()) {
+    return Accessor(createInstance(height, alloc));
   }
 
-  // create a shared_ptr skiplist object with initial head height.
-  static boost::shared_ptr<SkipListType> createInstance(int height=1) {
-    return boost::shared_ptr<SkipListType>(new SkipListType(height));
+  // Create a shared_ptr skiplist object with initial head height.
+  static std::shared_ptr<SkipListType> createInstance(
+      int height = 1, const NodeAlloc& alloc = NodeAlloc()) {
+    return std::make_shared<ConcurrentSkipList>(height, alloc);
   }
 
   //===================================================================
@@ -176,18 +183,18 @@ class ConcurrentSkipList {
   //===================================================================
 
   ~ConcurrentSkipList() {
-    LOG_IF(FATAL, recycler_.refs() > 0)
-      << "number of accessors is not 0, " << recycler_.refs() << " instead!"
-      << " This shouldn't have happened!";
-    while (NodeType* current = head_.load(std::memory_order_relaxed)) {
+    /* static */ if (NodeType::template destroyIsNoOp<NodeAlloc>()) {
+      // Avoid traversing the list if using arena allocator.
+      return;
+    }
+    for (NodeType* current = head_.load(std::memory_order_relaxed); current; ) {
       NodeType* tmp = current->skip(0);
-      NodeType::destroy(current);
-      head_.store(tmp, std::memory_order_relaxed);
+      NodeType::destroy(recycler_.alloc(), current);
+      current = tmp;
     }
   }
 
  private:
-
   static bool greater(const value_type &data, const NodeType *node) {
     return node && Comp()(node->data(), data);
   }
@@ -222,87 +229,12 @@ class ConcurrentSkipList {
     return foundLayer;
   }
 
-  struct Recycler : private boost::noncopyable {
-    Recycler() : refs_(0), dirty_(false) { lock_.init(); }
-
-    ~Recycler() {
-      if (nodes_) {
-        for (auto& node : *nodes_) {
-          NodeType::destroy(node);
-        }
-      }
-    }
-
-    void add(NodeType* node) {
-      std::lock_guard<MicroSpinLock> g(lock_);
-      if (nodes_.get() == nullptr) {
-        nodes_.reset(new std::vector<NodeType*>(1, node));
-      } else {
-        nodes_->push_back(node);
-      }
-      DCHECK_GT(refs(), 0);
-      dirty_.store(true, std::memory_order_relaxed);
-    }
-
-    int refs() const {
-      return refs_.load(std::memory_order_relaxed);
-    }
-
-    int addRef() {
-      return refs_.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    int release() {
-      // We don't expect to clean the recycler immediately everytime it is OK
-      // to do so. Here, it is possible that multiple accessors all release at
-      // the same time but nobody would clean the recycler here. If this
-      // happens, the recycler will usually still get cleaned when
-      // such a race doesn't happen. The worst case is the recycler will
-      // eventually get deleted along with the skiplist.
-      if (LIKELY(!dirty_.load(std::memory_order_relaxed) || refs() > 1)) {
-        return refs_.fetch_add(-1, std::memory_order_relaxed);
-      }
-
-      boost::scoped_ptr<std::vector<NodeType*> > newNodes;
-      {
-        std::lock_guard<MicroSpinLock> g(lock_);
-        if (nodes_.get() == nullptr || refs() > 1) {
-          return refs_.fetch_add(-1, std::memory_order_relaxed);
-        }
-        // once refs_ reaches 1 and there is no other accessor, it is safe to
-        // remove all the current nodes in the recycler, as we already acquired
-        // the lock here so no more new nodes can be added, even though new
-        // accessors may be added after that.
-        newNodes.swap(nodes_);
-        dirty_.store(false, std::memory_order_relaxed);
-      }
-
-      // TODO(xliu) should we spawn a thread to do this when there are large
-      // number of nodes in the recycler?
-      for (auto& node : *newNodes) {
-        NodeType::destroy(node);
-      }
-
-      // decrease the ref count at the very end, to minimize the
-      // chance of other threads acquiring lock_ to clear the deleted
-      // nodes again.
-      return refs_.fetch_add(-1, std::memory_order_relaxed);
-    }
-
-   private:
-    boost::scoped_ptr<std::vector<NodeType*>> nodes_;
-    std::atomic<int32_t> refs_; // current number of visitors to the list
-    std::atomic<bool> dirty_; // whether *nodes_ is non-empty
-    MicroSpinLock lock_; // protects access to *nodes_
-  };  // class ConcurrentSkipList::Recycler
-
-  explicit ConcurrentSkipList(int height) :
-    head_(NodeType::create(height, value_type(), true)), size_(0) {}
-
   size_t size() const { return size_.load(std::memory_order_relaxed); }
+
   int height() const {
     return head_.load(std::memory_order_consume)->height();
   }
+
   int maxLayer() const { return height() - 1; }
 
   size_t incrementSize(int delta) {
@@ -352,7 +284,8 @@ class ConcurrentSkipList {
   //     list with the same key.
   //   pair.second stores whether the data is added successfully:
   //     0 means not added, otherwise reutrns the new size.
-  std::pair<NodeType*, size_t> addOrGetData(const value_type &data) {
+  template<typename U>
+  std::pair<NodeType*, size_t> addOrGetData(U &&data) {
     NodeType *preds[MAX_HEIGHT], *succs[MAX_HEIGHT];
     NodeType *newNode;
     size_t newSize;
@@ -381,7 +314,8 @@ class ConcurrentSkipList {
       }
 
       // locks acquired and all valid, need to modify the links under the locks.
-      newNode = NodeType::create(nodeHeight, data);
+      newNode =
+        NodeType::create(recycler_.alloc(), nodeHeight, std::forward<U>(data));
       for (int layer = 0; layer < nodeHeight; ++layer) {
         newNode->setSkip(layer, succs[layer]);
         preds[layer]->setSkip(layer, newNode);
@@ -496,10 +430,11 @@ class ConcurrentSkipList {
     bool found = false;
     while (!found) {
       // stepping down
-      for (; ht > 0 && less(data, pred->skip(ht - 1)); --ht) {}
-      if (ht == 0) return std::make_pair(pred->skip(0), 0);  // not found
+      for (; ht > 0 && less(data, node = pred->skip(ht - 1)); --ht) {}
+      if (ht == 0) return std::make_pair(node, 0);  // not found
+      // node <= data now, but we need to fix up ht
+      --ht;
 
-      node = pred->skip(--ht);  // node <= data now
       // stepping right
       while (greater(data, node)) {
         pred = node;
@@ -542,17 +477,18 @@ class ConcurrentSkipList {
       return;
     }
 
-    NodeType* newHead = NodeType::create(height, value_type(), true);
+    NodeType* newHead =
+      NodeType::create(recycler_.alloc(), height, value_type(), true);
 
     { // need to guard the head node in case others are adding/removing
       // nodes linked to the head.
       ScopedLocker g = oldHead->acquireGuard();
-      newHead->promoteFrom(oldHead);
+      newHead->copyHead(oldHead);
       NodeType* expected = oldHead;
       if (!head_.compare_exchange_strong(expected, newHead,
           std::memory_order_release)) {
         // if someone has already done the swap, just return.
-        NodeType::destroy(newHead);
+        NodeType::destroy(recycler_.alloc(), newHead);
         return;
       }
       oldHead->setMarkedForRemoval();
@@ -564,15 +500,15 @@ class ConcurrentSkipList {
     recycler_.add(node);
   }
 
+  detail::NodeRecycler<NodeType, NodeAlloc> recycler_;
   std::atomic<NodeType*> head_;
-  Recycler recycler_;
   std::atomic<size_t> size_;
 };
 
-template<typename T, typename Comp, int MAX_HEIGHT>
-class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
+template<typename T, typename Comp, typename NodeAlloc, int MAX_HEIGHT>
+class ConcurrentSkipList<T, Comp, NodeAlloc, MAX_HEIGHT>::Accessor {
   typedef detail::SkipListNode<T> NodeType;
-  typedef ConcurrentSkipList<T, Comp, MAX_HEIGHT> SkipListType;
+  typedef ConcurrentSkipList<T, Comp, NodeAlloc, MAX_HEIGHT> SkipListType;
  public:
   typedef T value_type;
   typedef T key_type;
@@ -588,7 +524,7 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
   typedef typename SkipListType::const_iterator const_iterator;
   typedef typename SkipListType::Skipper Skipper;
 
-  explicit Accessor(boost::shared_ptr<ConcurrentSkipList> skip_list)
+  explicit Accessor(std::shared_ptr<ConcurrentSkipList> skip_list)
     : slHolder_(std::move(skip_list))
   {
     sl_ = slHolder_.get();
@@ -612,7 +548,7 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
   Accessor& operator=(const Accessor &accessor) {
     if (this != &accessor) {
       slHolder_ = accessor.slHolder_;
-      sl_->recycler_.release();
+      sl_->recycler_.releaseRef();
       sl_ = accessor.sl_;
       sl_->recycler_.addRef();
     }
@@ -620,7 +556,7 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
   }
 
   ~Accessor() {
-    sl_->recycler_.release();
+    sl_->recycler_.releaseRef();
   }
 
   bool empty() const { return sl_->size() == 0; }
@@ -644,8 +580,10 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
   const_iterator cbegin() const { return begin(); }
   const_iterator cend() const { return end(); }
 
-  std::pair<iterator, bool> insert(const key_type &data) {
-    auto ret = sl_->addOrGetData(data);
+  template<typename U,
+    typename=typename std::enable_if<std::is_convertible<U, T>::value>::type>
+  std::pair<iterator, bool> insert(U&& data) {
+    auto ret = sl_->addOrGetData(std::forward<U>(data));
     return std::make_pair(iterator(ret.first), ret.second);
   }
   size_t erase(const key_type &data) { return remove(data); }
@@ -697,7 +635,7 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Accessor {
 
  private:
   SkipListType *sl_;
-  boost::shared_ptr<SkipListType> slHolder_;
+  std::shared_ptr<SkipListType> slHolder_;
 };
 
 // implements forward iterator concept.
@@ -737,10 +675,10 @@ class detail::csl_iterator :
 };
 
 // Skipper interface
-template<typename T, typename Comp, int MAX_HEIGHT>
-class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Skipper {
+template<typename T, typename Comp, typename NodeAlloc, int MAX_HEIGHT>
+class ConcurrentSkipList<T, Comp, NodeAlloc, MAX_HEIGHT>::Skipper {
   typedef detail::SkipListNode<T> NodeType;
-  typedef ConcurrentSkipList<T, Comp, MAX_HEIGHT> SkipListType;
+  typedef ConcurrentSkipList<T, Comp, NodeAlloc, MAX_HEIGHT> SkipListType;
   typedef typename SkipListType::Accessor Accessor;
 
  public:
@@ -749,7 +687,7 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Skipper {
   typedef T* pointer;
   typedef ptrdiff_t difference_type;
 
-  Skipper(const boost::shared_ptr<SkipListType>& skipList) :
+  Skipper(const std::shared_ptr<SkipListType>& skipList) :
     accessor_(skipList) {
     init();
   }
@@ -797,17 +735,17 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Skipper {
   }
 
   const value_type &data() const {
-    DCHECK(succs_[0] != NULL);
+    DCHECK(succs_[0] != nullptr);
     return succs_[0]->data();
   }
 
   value_type &operator *() const {
-    DCHECK(succs_[0] != NULL);
+    DCHECK(succs_[0] != nullptr);
     return succs_[0]->data();
   }
 
   value_type *operator->() {
-    DCHECK(succs_[0] != NULL);
+    DCHECK(succs_[0] != nullptr);
     return &succs_[0]->data();
   }
 
@@ -832,7 +770,8 @@ class ConcurrentSkipList<T, Comp, MAX_HEIGHT>::Skipper {
       findInsertionPoint(preds_[lyr], lyr, data, preds_, succs_);
     if (foundLayer < 0) return false;
 
-    DCHECK(succs_[0] != NULL) << "lyr=" << lyr << "; max_layer=" << max_layer;
+    DCHECK(succs_[0] != nullptr) << "lyr=" << lyr
+                                 << "; max_layer=" << max_layer;
     return !succs_[0]->markedForRemoval();
   }
 

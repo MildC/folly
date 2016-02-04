@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-#include "folly/ThreadCachedInt.h"
-#include "folly/Hash.h"
+#include <folly/ThreadCachedInt.h>
+#include <folly/Hash.h>
 
 #include <atomic>
 #include <thread>
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
-#include "folly/Benchmark.h"
+#include <folly/Benchmark.h>
 
 using namespace folly;
 
@@ -152,8 +152,8 @@ ThreadLocal<int64_t> globalTL64Baseline;
 ThreadLocal<int32_t> globalTL32Baseline;
 std::atomic<int64_t> globalInt64Baseline(0);
 std::atomic<int32_t> globalInt32Baseline(0);
-__thread int64_t global__thread64;
-__thread int32_t global__thread32;
+FOLLY_TLS int64_t global__thread64;
+FOLLY_TLS int32_t global__thread32;
 
 // Alternate lock-free implementation.  Achieves about the same performance,
 // but uses about 20x more memory than ThreadCachedInt with 24 threads.
@@ -162,7 +162,8 @@ struct ShardedAtomicInt {
   std::atomic<int64_t> ints_[kBuckets_];
 
   inline void inc(int64_t val = 1) {
-    int bucket = hash::twang_mix64(pthread_self()) & (kBuckets_ - 1);
+    int bucket = hash::twang_mix64(
+      uint64_t(pthread_self())) & (kBuckets_ - 1);
     std::atomic_fetch_add(&ints_[bucket], val);
   }
 
@@ -193,8 +194,10 @@ REG_BASELINE(_thread64, global__thread64 += 1);
 REG_BASELINE(_thread32, global__thread32 += 1);
 REG_BASELINE(ThreadLocal64, *globalTL64Baseline += 1);
 REG_BASELINE(ThreadLocal32, *globalTL32Baseline += 1);
-REG_BASELINE(atomic_inc64, std::atomic_fetch_add(&globalInt64Baseline, 1L));
-REG_BASELINE(atomic_inc32, std::atomic_fetch_add(&globalInt32Baseline, 1));
+REG_BASELINE(atomic_inc64,
+             std::atomic_fetch_add(&globalInt64Baseline, int64_t(1)));
+REG_BASELINE(atomic_inc32,
+             std::atomic_fetch_add(&globalInt32Baseline, int32_t(1)));
 REG_BASELINE(ShardedAtm64, shd_int64.inc());
 
 BENCHMARK_PARAM(BM_mt_cache_size64, 0);
@@ -236,9 +239,9 @@ BENCHMARK_DRAW_LINE();
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  google::SetCommandLineOptionWithMode(
-    "bm_max_iters", "10000000", google::SET_FLAG_IF_DEFAULT
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  gflags::SetCommandLineOptionWithMode(
+    "bm_min_usec", "10000", gflags::SET_FLAG_IF_DEFAULT
   );
   if (FLAGS_benchmark) {
     folly::runBenchmarks();

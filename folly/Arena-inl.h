@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,7 +31,6 @@ Arena<Alloc>::Block::allocate(Alloc& alloc, size_t size, bool allowSlack) {
   }
 
   void* mem = alloc.allocate(allocSize);
-  assert(isAligned(mem));
   return std::make_pair(new (mem) Block(), allocSize - sizeof(Block));
 }
 
@@ -45,6 +44,13 @@ template <class Alloc>
 void* Arena<Alloc>::allocateSlow(size_t size) {
   std::pair<Block*, size_t> p;
   char* start;
+
+  size_t allocSize = std::max(size, minBlockSize()) + sizeof(Block);
+  if (sizeLimit_ != kNoSizeLimit &&
+      allocSize > sizeLimit_ - totalAllocatedSize_) {
+    throw std::bad_alloc();
+  }
+
   if (size > minBlockSize()) {
     // Allocate a large block for this chunk only, put it at the back of the
     // list so it doesn't get used for small allocations; don't change ptr_
@@ -63,6 +69,7 @@ void* Arena<Alloc>::allocateSlow(size_t size) {
   }
 
   assert(p.second >= size);
+  totalAllocatedSize_ += p.second + sizeof(Block);
   return start;
 }
 
@@ -71,6 +78,8 @@ void Arena<Alloc>::merge(Arena<Alloc>&& other) {
   blocks_.splice_after(blocks_.before_begin(), other.blocks_);
   other.blocks_.clear();
   other.ptr_ = other.end_ = nullptr;
+  totalAllocatedSize_ += other.totalAllocatedSize_;
+  other.totalAllocatedSize_ = 0;
 }
 
 template <class Alloc>

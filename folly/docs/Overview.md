@@ -33,7 +33,7 @@ At the top level Folly uses the classic "stuttering" scheme
 `folly/folly` used by Boost and others. The first directory serves as
 an installation root of the library (with possible versioning a la
 `folly-1.0/`), and the second is to distinguish the library when
-including files, e.g. `#include "folly/FBString.h"`.
+including files, e.g. `#include <folly/FBString.h>`.
 
 The directory structure is flat (mimicking the namespace structure),
 i.e. we don't have an elaborate directory hierarchy (it is possible
@@ -225,6 +225,10 @@ STL allocator wrapping a simple allocate/deallocate interface.
 ####`String.h`
 
 String utilities that connect `folly::fbstring` with `std::string`.
+
+####`Subprocess.h`
+
+Subprocess library, modeled after Python's subprocess module.
 
 ####[`Synchronized.h`](Synchronized.md)
 

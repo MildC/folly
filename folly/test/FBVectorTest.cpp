@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,16 +17,17 @@
 //
 // Author: andrei.alexandrescu@fb.com
 
-#include "folly/Traits.h"
-#include "folly/Random.h"
-#include "folly/FBString.h"
-#include "folly/FBVector.h"
-#include "folly/Benchmark.h"
+#include <folly/Foreach.h>
+#include <folly/Traits.h>
+#include <folly/Random.h>
+#include <folly/FBString.h>
+#include <folly/FBVector.h>
 
 #include <gflags/gflags.h>
 
 #include <gtest/gtest.h>
 #include <list>
+#include <map>
 #include <memory>
 #include <boost/random.hpp>
 
@@ -36,8 +37,6 @@ using namespace folly;
 auto static const seed = randomNumberSeed();
 typedef boost::mt19937 RandomT;
 static RandomT rng(seed);
-static const size_t maxString = 100;
-static const bool avoidAliasing = true;
 
 template <class Integral1, class Integral2>
 Integral2 random(Integral1 low, Integral2 up) {
@@ -55,9 +54,8 @@ void randomString(String* toFill, unsigned int maxSize = 1000) {
 }
 
 template <class String, class Integral>
-void Num2String(String& str, Integral n) {
+void Num2String(String& str, Integral /* n */) {
   str.resize(10, '\0');
-//    ultoa((unsigned long)n, &str[0], 10);
   sprintf(&str[0], "%ul", 10);
   str.resize(strlen(str.c_str()));
 }
@@ -225,35 +223,68 @@ TEST(FBVector, task858056) {
   EXPECT_EQ("Cycle detected: [baz] [bar] [foo] ", message);
 }
 
-#define CONCAT(A, B) CONCAT_HELPER(A, B)
-#define CONCAT_HELPER(A, B) A##B
-#define BENCHFUN(F) CONCAT(CONCAT(BM_, F), CONCAT(_, VECTOR))
-#define TESTFUN(F) TEST(fbvector, CONCAT(F, VECTOR))
+TEST(FBVector, move_iterator) {
+  fbvector<int> base = { 0, 1, 2 };
 
-typedef vector<int> IntVector;
-typedef fbvector<int> IntFBVector;
-typedef vector<folly::fbstring> FBStringVector;
-typedef fbvector<folly::fbstring> FBStringFBVector;
+  auto cp1 = base;
+  fbvector<int> fbvi1(std::make_move_iterator(cp1.begin()),
+                      std::make_move_iterator(cp1.end()));
+  EXPECT_EQ(fbvi1, base);
 
-#define VECTOR IntVector
-#include "folly/test/FBVectorTestBenchmarks.cpp.h"
-#undef VECTOR
-#define VECTOR IntFBVector
-#include "folly/test/FBVectorTestBenchmarks.cpp.h"
-#undef VECTOR
-#define VECTOR FBStringVector
-#include "folly/test/FBVectorTestBenchmarks.cpp.h"
-#undef VECTOR
-#define VECTOR FBStringFBVector
-#include "folly/test/FBVectorTestBenchmarks.cpp.h"
-#undef VECTOR
+  auto cp2 = base;
+  fbvector<int> fbvi2;
+  fbvi2.assign(std::make_move_iterator(cp2.begin()),
+               std::make_move_iterator(cp2.end()));
+  EXPECT_EQ(fbvi2, base);
+
+  auto cp3 = base;
+  fbvector<int> fbvi3;
+  fbvi3.insert(fbvi3.end(),
+               std::make_move_iterator(cp3.begin()),
+               std::make_move_iterator(cp3.end()));
+  EXPECT_EQ(fbvi3, base);
+}
+
+TEST(FBVector, reserve_consistency) {
+  struct S { int64_t a, b, c, d; };
+
+  fbvector<S> fb1;
+  for (size_t i = 0; i < 1000; ++i) {
+    fb1.reserve(1);
+    EXPECT_EQ(fb1.size(), 0);
+    fb1.shrink_to_fit();
+  }
+}
+
+TEST(FBVector, vector_of_maps) {
+  fbvector<std::map<std::string, std::string>> v;
+
+  v.push_back(std::map<std::string, std::string>());
+  v.push_back(std::map<std::string, std::string>());
+
+  EXPECT_EQ(2, v.size());
+
+  v[1]["hello"] = "world";
+  EXPECT_EQ(0, v[0].size());
+  EXPECT_EQ(1, v[1].size());
+
+  v[0]["foo"] = "bar";
+  EXPECT_EQ(1, v[0].size());
+  EXPECT_EQ(1, v[1].size());
+}
+
+TEST(FBVector, shrink_to_fit_after_clear) {
+  fbvector<int> fb1;
+  fb1.push_back(42);
+  fb1.push_back(1337);
+  fb1.clear();
+  fb1.shrink_to_fit();
+  EXPECT_EQ(fb1.size(), 0);
+  EXPECT_EQ(fb1.capacity(), 0);
+}
 
 int main(int argc, char** argv) {
   testing::InitGoogleTest(&argc, argv);
-  google::ParseCommandLineFlags(&argc, &argv, true);
-  auto ret = RUN_ALL_TESTS();
-  if (!ret && FLAGS_benchmark) {
-    folly::runBenchmarks();
-  }
-  return ret;
+  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  return RUN_ALL_TESTS();
 }

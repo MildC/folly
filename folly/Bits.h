@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,17 +17,23 @@
 /**
  * Various low-level, bit-manipulation routines.
  *
- * findFirstSet(x)
+ * findFirstSet(x)  [constexpr]
  *    find first (least significant) bit set in a value of an integral type,
  *    1-based (like ffs()).  0 = no bits are set (x == 0)
  *
- * findLastSet(x)
+ * findLastSet(x)  [constexpr]
  *    find last (most significant) bit set in a value of an integral type,
  *    1-based.  0 = no bits are set (x == 0)
- *    for x != 0, findFirstSet(x) == 1 + floor(log2(x))
+ *    for x != 0, findLastSet(x) == 1 + floor(log2(x))
  *
- * nextPowTwo(x)
+ * nextPowTwo(x)  [constexpr]
  *    Finds the next power of two >= x.
+ *
+ * isPowTwo(x)  [constexpr]
+ *    return true iff x is a power of two
+ *
+ * popcount(x)
+ *    return the number of 1 bits in x
  *
  * Endian
  *    convert between native, big, and little endian representation
@@ -49,20 +55,26 @@
 #ifndef FOLLY_BITS_H_
 #define FOLLY_BITS_H_
 
-#include "folly/Portability.h"
-
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
+#if !defined(__clang__) && !(defined(_MSC_VER) && (_MSC_VER < 1900))
+#define FOLLY_INTRINSIC_CONSTEXPR constexpr
+#else
+// GCC and MSVC 2015+ are the only compilers with
+// intrinsics constexpr.
+#define FOLLY_INTRINSIC_CONSTEXPR const
 #endif
 
-#include "folly/detail/BitIteratorDetail.h"
-#include "folly/Likely.h"
+#include <folly/Portability.h>
 
-#include <byteswap.h>
+#include <folly/detail/BitsDetail.h>
+#include <folly/detail/BitIteratorDetail.h>
+#include <folly/Likely.h>
+
+#if FOLLY_HAVE_BYTESWAP_H
+# include <byteswap.h>
+#endif
+
 #include <cassert>
 #include <cinttypes>
-#include <cstring>  // for ffs, ffsl, ffsll
-#include <endian.h>
 #include <iterator>
 #include <limits>
 #include <type_traits>
@@ -72,127 +84,93 @@
 namespace folly {
 
 // Generate overloads for findFirstSet as wrappers around
-// appropriate ffs, ffsl, ffsll functions from glibc.
-// We first define these overloads for signed types (because ffs, ffsl, ffsll
-// take int, long, and long long as arguments, respectively) and then
-// define an overload for unsigned that forwards to the overload for the
-// corresponding signed type.
+// appropriate ffs, ffsl, ffsll gcc builtins
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
-   std::is_signed<T>::value &&
-   (std::numeric_limits<T>::digits <= std::numeric_limits<int>::digits)),
+   std::is_unsigned<T>::value &&
+   sizeof(T) <= sizeof(unsigned int)),
   unsigned int>::type
   findFirstSet(T x) {
-  return ::ffs(static_cast<int>(x));
+  return __builtin_ffs(x);
 }
 
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
-   std::is_signed<T>::value &&
-   (std::numeric_limits<T>::digits > std::numeric_limits<int>::digits) &&
-   (std::numeric_limits<T>::digits <= std::numeric_limits<long>::digits)),
+   std::is_unsigned<T>::value &&
+   sizeof(T) > sizeof(unsigned int) &&
+   sizeof(T) <= sizeof(unsigned long)),
   unsigned int>::type
   findFirstSet(T x) {
-  return ::ffsl(static_cast<long>(x));
+  return __builtin_ffsl(x);
 }
 
-#ifdef FOLLY_HAVE_FFSLL
-
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
-   std::is_signed<T>::value &&
-   (std::numeric_limits<T>::digits > std::numeric_limits<long>::digits) &&
-   (std::numeric_limits<T>::digits <= std::numeric_limits<long long>::digits)),
+   std::is_unsigned<T>::value &&
+   sizeof(T) > sizeof(unsigned long) &&
+   sizeof(T) <= sizeof(unsigned long long)),
   unsigned int>::type
   findFirstSet(T x) {
-  return ::ffsll(static_cast<long long>(x));
+  return __builtin_ffsll(x);
 }
 
-#endif
-
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
-  (std::is_integral<T>::value &&
-   !std::is_signed<T>::value),
+  (std::is_integral<T>::value && std::is_signed<T>::value),
   unsigned int>::type
   findFirstSet(T x) {
-  // Note that conversion from an unsigned type to the corresponding signed
+  // Note that conversion from a signed type to the corresponding unsigned
   // type is technically implementation-defined, but will likely work
   // on any impementation that uses two's complement.
-  return findFirstSet(static_cast<typename std::make_signed<T>::type>(x));
+  return findFirstSet(static_cast<typename std::make_unsigned<T>::type>(x));
 }
-
-namespace detail {
-
-// Portable, but likely slow...
-inline unsigned int findLastSetPortable(uint64_t x) {
-  unsigned int r = (x != 0);  // 1-based index, except for x==0
-  while (x >>= 1) {
-    ++r;
-  }
-  return r;
-}
-
-}  // namespace detail
-
-#ifdef __GNUC__
 
 // findLastSet: return the 1-based index of the highest bit set
 // for x > 0, findLastSet(x) == 1 + floor(log2(x))
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
    std::is_unsigned<T>::value &&
-   (std::numeric_limits<T>::digits <=
-    std::numeric_limits<unsigned int>::digits)),
+   sizeof(T) <= sizeof(unsigned int)),
   unsigned int>::type
   findLastSet(T x) {
   return x ? 8 * sizeof(unsigned int) - __builtin_clz(x) : 0;
 }
 
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
    std::is_unsigned<T>::value &&
-   (std::numeric_limits<T>::digits >
-    std::numeric_limits<unsigned int>::digits) &&
-   (std::numeric_limits<T>::digits <=
-    std::numeric_limits<unsigned long>::digits)),
+   sizeof(T) > sizeof(unsigned int) &&
+   sizeof(T) <= sizeof(unsigned long)),
   unsigned int>::type
   findLastSet(T x) {
   return x ? 8 * sizeof(unsigned long) - __builtin_clzl(x) : 0;
 }
 
 template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
    std::is_unsigned<T>::value &&
-   (std::numeric_limits<T>::digits >
-    std::numeric_limits<unsigned long>::digits) &&
-   (std::numeric_limits<T>::digits <=
-    std::numeric_limits<unsigned long long>::digits)),
+   sizeof(T) > sizeof(unsigned long) &&
+   sizeof(T) <= sizeof(unsigned long long)),
   unsigned int>::type
   findLastSet(T x) {
   return x ? 8 * sizeof(unsigned long long) - __builtin_clzll(x) : 0;
 }
 
-#else  /* !__GNUC__ */
-
 template <class T>
-typename std::enable_if<
-  (std::is_integral<T>::value &&
-   std::is_unsigned<T>::value),
-  unsigned int>::type
-  findLastSet(T x) {
-  return detail:findLastSetPortable(x);
-}
-
-#endif
-
-template <class T>
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   (std::is_integral<T>::value &&
    std::is_signed<T>::value),
@@ -201,62 +179,47 @@ typename std::enable_if<
   return findLastSet(static_cast<typename std::make_unsigned<T>::type>(x));
 }
 
-namespace detail {
-
 template <class T>
-inline
-typename std::enable_if<
-  std::is_integral<T>::value && std::is_unsigned<T>::value,
-  T>::type
-nextPowTwoPortable(T v) {
-  if (UNLIKELY(v == 0)) {
-    return 1;
-  }
-
-  --v;
-  for (uint32_t i = 1; i < sizeof(T) * 8; i <<= 8) {
-    v |= (v >> i);
-    v |= (v >> (i << 1));
-    v |= (v >> (i << 2));
-    v |= (v >> (i << 3));
-    v |= (v >> (i << 4));
-    v |= (v >> (i << 5));
-    v |= (v >> (i << 6));
-    v |= (v >> (i << 7));
-  }
-  return v + 1;
-}
-
-}  // namespace detail
-
-#ifdef __GNUC__
-
-template <class T>
-inline
+inline FOLLY_INTRINSIC_CONSTEXPR
 typename std::enable_if<
   std::is_integral<T>::value && std::is_unsigned<T>::value,
   T>::type
 nextPowTwo(T v) {
-  if (UNLIKELY(v == 0)) {
-    return 1;
-  }
-  return 1ul << findLastSet(v - 1);
+  return v ? (1ul << findLastSet(v - 1)) : 1;
 }
-
-#else /* __GNUC__ */
 
 template <class T>
-inline
+inline constexpr
 typename std::enable_if<
   std::is_integral<T>::value && std::is_unsigned<T>::value,
-  T>::type
-nextPowTwo(T v) {
-  return detail::nextPowTwoPortable(v);
+  bool>::type
+isPowTwo(T v) {
+  return (v != 0) && !(v & (v - 1));
 }
 
-#endif /* __GNUC__ */
+/**
+ * Population count
+ */
+template <class T>
+inline typename std::enable_if<
+  (std::is_integral<T>::value &&
+   std::is_unsigned<T>::value &&
+   sizeof(T) <= sizeof(unsigned int)),
+  size_t>::type
+  popcount(T x) {
+  return detail::popcount(x);
+}
 
-
+template <class T>
+inline typename std::enable_if<
+  (std::is_integral<T>::value &&
+   std::is_unsigned<T>::value &&
+   sizeof(T) > sizeof(unsigned int) &&
+   sizeof(T) <= sizeof(unsigned long long)),
+  size_t>::type
+  popcount(T x) {
+  return detail::popcountll(x);
+}
 
 /**
  * Endianness detection and manipulation primitives.
@@ -269,23 +232,54 @@ struct EndianIntBase {
   static T swap(T x);
 };
 
+#ifndef _MSC_VER
+
+/**
+ * If we have the bswap_16 macro from byteswap.h, use it; otherwise, provide our
+ * own definition.
+ */
+#ifdef bswap_16
+# define our_bswap16 bswap_16
+#else
+
+template<class Int16>
+inline constexpr typename std::enable_if<
+  sizeof(Int16) == 2,
+  Int16>::type
+our_bswap16(Int16 x) {
+  return ((x >> 8) & 0xff) | ((x & 0xff) << 8);
+}
+#endif
+
+#endif
+
 #define FB_GEN(t, fn) \
 template<> inline t EndianIntBase<t>::swap(t x) { return fn(x); }
 
 // fn(x) expands to (x) if the second argument is empty, which is exactly
-// what we want for [u]int8_t
+// what we want for [u]int8_t. Also, gcc 4.7 on Intel doesn't have
+// __builtin_bswap16 for some reason, so we have to provide our own.
 FB_GEN( int8_t,)
 FB_GEN(uint8_t,)
-FB_GEN( int64_t, bswap_64)
-FB_GEN(uint64_t, bswap_64)
-FB_GEN( int32_t, bswap_32)
-FB_GEN(uint32_t, bswap_32)
-FB_GEN( int16_t, bswap_16)
-FB_GEN(uint16_t, bswap_16)
+#ifdef _MSC_VER
+FB_GEN( int64_t, _byteswap_uint64)
+FB_GEN(uint64_t, _byteswap_uint64)
+FB_GEN( int32_t, _byteswap_ulong)
+FB_GEN(uint32_t, _byteswap_ulong)
+FB_GEN( int16_t, _byteswap_ushort)
+FB_GEN(uint16_t, _byteswap_ushort)
+#else
+FB_GEN( int64_t, __builtin_bswap64)
+FB_GEN(uint64_t, __builtin_bswap64)
+FB_GEN( int32_t, __builtin_bswap32)
+FB_GEN(uint32_t, __builtin_bswap32)
+FB_GEN( int16_t, our_bswap16)
+FB_GEN(uint16_t, our_bswap16)
+#endif
 
 #undef FB_GEN
 
-#if __BYTE_ORDER == __LITTLE_ENDIAN
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 
 template <class T>
 struct EndianInt : public detail::EndianIntBase<T> {
@@ -294,7 +288,7 @@ struct EndianInt : public detail::EndianIntBase<T> {
   static T little(T x) { return x; }
 };
 
-#elif __BYTE_ORDER == __BIG_ENDIAN
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
 
 template <class T>
 struct EndianInt : public detail::EndianIntBase<T> {
@@ -305,7 +299,7 @@ struct EndianInt : public detail::EndianIntBase<T> {
 
 #else
 # error Your machine uses a weird endianness!
-#endif  /* __BYTE_ORDER */
+#endif  /* __BYTE_ORDER__ */
 
 }  // namespace detail
 
@@ -329,6 +323,20 @@ struct EndianInt : public detail::EndianIntBase<T> {
 
 class Endian {
  public:
+  enum class Order : uint8_t {
+    LITTLE,
+    BIG
+  };
+
+  static constexpr Order order =
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    Order::LITTLE;
+#elif __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+    Order::BIG;
+#else
+# error Your machine uses a weird endianness!
+#endif  /* __BYTE_ORDER__ */
+
   template <class T> static T swap(T x) {
     return detail::EndianInt<T>::swap(x);
   }
@@ -339,10 +347,12 @@ class Endian {
     return detail::EndianInt<T>::little(x);
   }
 
+#if !defined(__ANDROID__)
   FB_GEN(64)
   FB_GEN(32)
   FB_GEN(16)
   FB_GEN(8)
+#endif
 };
 
 #undef FB_GEN
@@ -371,7 +381,7 @@ class BitIterator
   /**
    * Return the number of bits in an element of the underlying iterator.
    */
-  static size_t bitsPerBlock() {
+  static unsigned int bitsPerBlock() {
     return std::numeric_limits<
       typename std::make_unsigned<
         typename std::iterator_traits<BaseIter>::value_type
@@ -383,11 +393,14 @@ class BitIterator
    * Construct a BitIterator that points at a given bit offset (default 0)
    * in iter.
    */
+  #pragma GCC diagnostic push // bitOffset shadows a member
+  #pragma GCC diagnostic ignored "-Wshadow"
   explicit BitIterator(const BaseIter& iter, size_t bitOffset=0)
     : bititerator_detail::BitIteratorBase<BaseIter>::type(iter),
       bitOffset_(bitOffset) {
     assert(bitOffset_ < bitsPerBlock());
   }
+  #pragma GCC diagnostic pop
 
   size_t bitOffset() const {
     return bitOffset_;
@@ -454,10 +467,10 @@ class BitIterator
   ssize_t distance_to(const BitIterator& other) const {
     return
       (other.base_reference() - this->base_reference()) * bitsPerBlock() +
-      (other.bitOffset_ - bitOffset_);
+      other.bitOffset_ - bitOffset_;
   }
 
-  ssize_t bitOffset_;
+  unsigned int bitOffset_;
 };
 
 /**
@@ -513,7 +526,43 @@ BitIterator<BaseIter> findFirstSet(BitIterator<BaseIter> begin,
   return end;
 }
 
+
+template <class T, class Enable=void> struct Unaligned;
+
+/**
+ * Representation of an unaligned value of a POD type.
+ */
+FOLLY_PACK_PUSH
+template <class T>
+struct Unaligned<
+    T,
+    typename std::enable_if<std::is_pod<T>::value>::type> {
+  Unaligned() = default;  // uninitialized
+  /* implicit */ Unaligned(T v) : value(v) { }
+  T value;
+} FOLLY_PACK_ATTR;
+FOLLY_PACK_POP
+
+/**
+ * Read an unaligned value of type T and return it.
+ */
+template <class T>
+inline T loadUnaligned(const void* p) {
+  static_assert(sizeof(Unaligned<T>) == sizeof(T), "Invalid unaligned size");
+  static_assert(alignof(Unaligned<T>) == 1, "Invalid alignment");
+  return static_cast<const Unaligned<T>*>(p)->value;
+}
+
+/**
+ * Write an unaligned value of type T.
+ */
+template <class T>
+inline void storeUnaligned(void* p, T value) {
+  static_assert(sizeof(Unaligned<T>) == sizeof(T), "Invalid unaligned size");
+  static_assert(alignof(Unaligned<T>) == 1, "Invalid alignment");
+  new (p) Unaligned<T>(value);
+}
+
 }  // namespace folly
 
 #endif /* FOLLY_BITS_H_ */
-

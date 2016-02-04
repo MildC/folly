@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -63,19 +63,21 @@
 #ifndef FOLLY_DYNAMIC_H_
 #define FOLLY_DYNAMIC_H_
 
-#include <unordered_map>
-#include <memory>
-#include <string>
-#include <utility>
-#include <ostream>
-#include <type_traits>
-#include <initializer_list>
 #include <cstdint>
+#include <initializer_list>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include <boost/operators.hpp>
 
-#include "folly/Traits.h"
-#include "folly/FBVector.h"
-#include "folly/FBString.h"
+#include <folly/FBString.h>
+#include <folly/Range.h>
+#include <folly/Traits.h>
 
 namespace folly {
 
@@ -83,7 +85,6 @@ namespace folly {
 
 struct dynamic;
 struct TypeError;
-template<> FOLLY_ASSUME_RELOCATABLE(dynamic);
 
 //////////////////////////////////////////////////////////////////////
 
@@ -108,9 +109,10 @@ struct dynamic : private boost::operators<dynamic> {
    * Object item iterators dereference as pairs of (key, value).
    */
 private:
-  typedef fbvector<dynamic> Array;
+  typedef std::vector<dynamic> Array;
 public:
   typedef Array::const_iterator const_iterator;
+  typedef dynamic value_type;
   struct const_key_iterator;
   struct const_value_iterator;
   struct const_item_iterator;
@@ -134,13 +136,20 @@ private:
   struct ObjectMaker;
 
 public:
-  template<class... Args> static ObjectMaker object(Args&&...);
+  static ObjectMaker object();
+  static ObjectMaker object(dynamic&&, dynamic&&);
+  static ObjectMaker object(dynamic const&, dynamic&&);
+  static ObjectMaker object(dynamic&&, dynamic const&);
+  static ObjectMaker object(dynamic const&, dynamic const&);
 
   /*
    * String compatibility constructors.
    */
+  /* implicit */ dynamic(StringPiece val);
   /* implicit */ dynamic(char const* val);
   /* implicit */ dynamic(std::string const& val);
+  /* implicit */ dynamic(fbstring const& val);
+  /* implicit */ dynamic(fbstring&& val);
 
   /*
    * This is part of the plumbing for object(), above.  Used to create
@@ -158,6 +167,7 @@ public:
    *   dynamic v = { 1, 2, 3, "foo" };
    */
   /* implicit */ dynamic(std::initializer_list<dynamic> il);
+  dynamic& operator=(std::initializer_list<dynamic> il);
 
   /*
    * Conversion constructors from most of the other types.
@@ -171,8 +181,8 @@ public:
   template<class Iterator> dynamic(Iterator first, Iterator last);
 
   dynamic(dynamic const&);
-  dynamic(dynamic&&);
-  ~dynamic();
+  dynamic(dynamic&&) noexcept;
+  ~dynamic() noexcept;
 
   /*
    * "Deep" equality comparison.  This will compare all the way down
@@ -214,7 +224,7 @@ public:
    * Basic guarantee only.
    */
   dynamic& operator=(dynamic const&);
-  dynamic& operator=(dynamic&&);
+  dynamic& operator=(dynamic&&) noexcept;
 
   /*
    * For simple dynamics (not arrays or objects), this prints the
@@ -251,18 +261,53 @@ public:
   Type type() const;
 
   /*
+   * Returns the type of this dynamic as a printable string.
+   */
+  const char* typeName() const;
+
+  /*
    * Extract a value while trying to convert to the specified type.
    * Throws exceptions if we cannot convert from the real type to the
    * requested type.
    *
    * Note you can only use this to access integral types or strings,
-   * since arrays and objects are generally best delt with as a
+   * since arrays and objects are generally best dealt with as a
    * dynamic.
    */
   fbstring asString() const;
   double   asDouble() const;
   int64_t  asInt() const;
   bool     asBool() const;
+
+  /*
+   * Extract the value stored in this dynamic without type conversion.
+   *
+   * These will throw a TypeError if the dynamic has a different type.
+   */
+  const fbstring& getString() const&;
+  double          getDouble() const&;
+  int64_t         getInt() const&;
+  bool            getBool() const&;
+  fbstring& getString() &;
+  double&   getDouble() &;
+  int64_t&  getInt() &;
+  bool&     getBool() &;
+  fbstring getString() &&;
+  double   getDouble() &&;
+  int64_t  getInt() &&;
+  bool     getBool() &&;
+
+  /*
+   * It is occasionally useful to access a string's internal pointer
+   * directly, without the type conversion of `asString()`.
+   *
+   * These will throw a TypeError if the dynamic is not a string.
+   */
+  const char* data()  const&;
+  const char* data()  && = delete;
+  const char* c_str() const&;
+  const char* c_str() && = delete;
+  StringPiece stringPiece() const;
 
   /*
    * Returns: true if this dynamic is null, an empty array, an empty
@@ -303,8 +348,8 @@ public:
    * AssociativeContainer-style find interface for objects.  Throws if
    * this is not an object.
    *
-   * Returns: end() if the key is not present, or an iterator pointing
-   * to the item.
+   * Returns: items().end() if the key is not present, or a
+   * const_item_iterator pointing to the item.
    */
   const_item_iterator find(dynamic const&) const;
 
@@ -322,8 +367,24 @@ public:
    * will throw a TypeError.  Using an index that is out of range or
    * object-element that's not present throws std::out_of_range.
    */
-  dynamic const& at(dynamic const&) const;
-  dynamic&       at(dynamic const&);
+  dynamic const& at(dynamic const&) const&;
+  dynamic&       at(dynamic const&) &;
+  dynamic        at(dynamic const&) &&;
+
+  /*
+   * Like 'at', above, except it returns either a pointer to the contained
+   * object or nullptr if it wasn't found. This allows a key to be tested for
+   * containment and retrieved in one operation. Example:
+   *
+   *   if (auto* found = d.get_ptr(key))
+   *     // use *found;
+   *
+   * Using these with dynamic objects that are not arrays or objects
+   * will throw a TypeError.
+   */
+  const dynamic* get_ptr(dynamic const&) const&;
+  dynamic* get_ptr(dynamic const&) &;
+  dynamic* get_ptr(dynamic const&) && = delete;
 
   /*
    * This works for access to both objects and arrays.
@@ -337,8 +398,9 @@ public:
    *
    * These functions do not invalidate iterators.
    */
-  dynamic&       operator[](dynamic const&);
-  dynamic const& operator[](dynamic const&) const;
+  dynamic&       operator[](dynamic const&) &;
+  dynamic const& operator[](dynamic const&) const&;
+  dynamic        operator[](dynamic const&) &&;
 
   /*
    * Only defined for objects, throws TypeError otherwise.
@@ -349,8 +411,10 @@ public:
    * a reference to the existing value if present, the new value otherwise.
    */
   dynamic
-  getDefault(const dynamic& k, const dynamic& v = dynamic::object) const;
-  dynamic&& getDefault(const dynamic& k, dynamic&& v) const;
+  getDefault(const dynamic& k, const dynamic& v = dynamic::object) const&;
+  dynamic getDefault(const dynamic& k, dynamic&& v) const&;
+  dynamic getDefault(const dynamic& k, const dynamic& v = dynamic::object) &&;
+  dynamic getDefault(const dynamic& k, dynamic&& v) &&;
   template<class K, class V = dynamic>
   dynamic& setDefault(K&& k, V&& v = dynamic::object);
 
@@ -372,6 +436,23 @@ public:
    * Invalidates iterators.
    */
   template<class K, class V> void insert(K&&, V&& val);
+
+  /*
+   * These functions merge two folly dynamic objects.
+   * The "update" and "update_missing" functions extend the object by
+   *  inserting the key/value pairs of mergeObj into the current object.
+   *  For update, if key is duplicated between the two objects, it
+   *  will overwrite with the value of the object being inserted (mergeObj).
+   *  For "update_missing", it will prefer the value in the original object
+   *
+   * The "merge" function creates a new object consisting of the key/value
+   * pairs of both mergeObj1 and mergeObj2
+   * If the key is duplicated between the two objects,
+   *  it will prefer value in the second object (mergeObj2)
+   */
+  void update(const dynamic& mergeObj);
+  void update_missing(const dynamic& other);
+  static dynamic merge(const dynamic& mergeObj1, const dynamic& mergeObj2);
 
   /*
    * Erase an element from a dynamic object, by key.
@@ -417,6 +498,14 @@ public:
   void push_back(dynamic&&);
 
   /*
+   * Remove an element from the back of an array.  If this is not an array,
+   * throws TypeError.
+   *
+   * Does not invalidate iterators.
+   */
+  void pop_back();
+
+  /*
    * Get a hash code.  This function is called by a std::hash<>
    * specialization, also.
    *
@@ -427,7 +516,6 @@ public:
 private:
   friend struct TypeError;
   struct ObjectImpl;
-  struct ObjectMaker;
   template<class T> struct TypeInfo;
   template<class T> struct CompareOp;
   template<class T> struct GetAddrImpl;
@@ -435,15 +523,16 @@ private:
 
   template<class T> T const& get() const;
   template<class T> T&       get();
-  template<class T> T*       get_nothrow();
-  template<class T> T const* get_nothrow() const;
-  template<class T> T*       getAddress();
-  template<class T> T const* getAddress() const;
+  template<class T> T*       get_nothrow() & noexcept;
+  template<class T> T const* get_nothrow() const& noexcept;
+  template<class T> T*       get_nothrow() && noexcept = delete;
+  template<class T> T*       getAddress() noexcept;
+  template<class T> T const* getAddress() const noexcept;
 
   template<class T> T asImpl() const;
 
   static char const* typeName(Type);
-  void destroy();
+  void destroy() noexcept;
   void print(std::ostream&) const;
   void print_as_pseudo_json(std::ostream&) const; // see json.cpp
 
@@ -469,7 +558,7 @@ private:
      * incomplete type right now).  (Note that in contrast we know it
      * is ok to do this with fbvector because we own it.)
      */
-    typename std::aligned_storage<
+    std::aligned_storage<
       sizeof(std::unordered_map<int,int>),
       alignof(std::unordered_map<int,int>)
     >::type objectBuffer;
@@ -480,6 +569,6 @@ private:
 
 }
 
-#include "folly/dynamic-inl.h"
+#include <folly/dynamic-inl.h>
 
 #endif

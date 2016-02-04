@@ -51,13 +51,21 @@ from optparse import OptionParser
 OUTPUT_FILE = "GroupVarintTables.cpp"
 
 def generate(f):
-    f.write("#include <stdint.h>\n"
-            "#include <x86intrin.h>\n"
-            "\n"
-            "namespace folly {\n"
-            "namespace detail {\n"
-            "\n"
-            "extern const __m128i groupVarintSSEMasks[] = {\n")
+    f.write("""
+#include <folly/Portability.h>
+
+#include <stdint.h>
+
+#if (FOLLY_X64 || defined(__i386__)) && (FOLLY_SSE >= 2)
+#include <x86intrin.h>
+#endif
+
+namespace folly {
+namespace detail {
+
+#if (FOLLY_X64 || defined(__i386__)) && (FOLLY_SSE >= 2)
+extern const __m128i groupVarintSSEMasks[] = {
+""")
 
     # Compute SSE masks
     for i in range(0, 256):
@@ -73,11 +81,13 @@ def generate(f):
             # 0xff: set corresponding byte in result to 0
             for k in range(d, 4):
                 vals[j] |= 0xff << (8 * k)
-        f.write("  {{0x{1:08x}{0:08x}U, 0x{3:08x}{2:08x}U}},\n".format(*vals))
+        f.write("  {{static_cast<int64_t>(0x{1:08x}{0:08x}), "
+            "static_cast<int64_t>(0x{3:08x}{2:08x})}},\n".format(*vals))
 
     f.write("};\n"
-            "\n"
-            "extern const uint8_t groupVarintLengths[] = {\n")
+        "#endif /*#if (FOLLY_X64 || defined(__i386__)) && (FOLLY_SSE >= 2)*/\n"
+        "\n"
+        "extern const uint8_t groupVarintLengths[] = {\n")
 
     # Also compute total encoded lengths, including key byte
     for i in range(0, 256):
@@ -87,10 +97,12 @@ def generate(f):
             offset += d
         f.write("  {0},\n".format(offset))
 
-    f.write("};\n"
-            "\n"
-            "}  // namespace detail\n"
-            "}  // namespace folly\n")
+    f.write("""
+};
+
+}  // namespace detail
+}  // namespace folly
+""")
 
 def main():
     parser = OptionParser()

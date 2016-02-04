@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -60,10 +60,11 @@
 #ifndef FOLLY_SORTED_VECTOR_TYPES_H_
 #define FOLLY_SORTED_VECTOR_TYPES_H_
 
-#include <vector>
 #include <algorithm>
-#include <utility>
+#include <initializer_list>
 #include <iterator>
+#include <utility>
+#include <vector>
 #include <boost/operators.hpp>
 #include <boost/bind.hpp>
 #include <boost/type_traits/is_same.hpp>
@@ -111,36 +112,36 @@ namespace detail {
   }
 
   template<class OurContainer, class Vector, class GrowthPolicy>
-  std::pair<typename OurContainer::iterator,bool>
+  typename OurContainer::iterator
   insert_with_hint(OurContainer& sorted,
                    Vector& cont,
                    typename OurContainer::iterator hint,
-                   typename OurContainer::value_type value,
+                   typename OurContainer::value_type&& value,
                    GrowthPolicy& po)
   {
     const typename OurContainer::value_compare& cmp(sorted.value_comp());
     if (hint == cont.end() || cmp(value, *hint)) {
       if (hint == cont.begin()) {
         po.increase_capacity(cont, cont.begin());
-        return std::make_pair(cont.insert(cont.begin(), value), true);
+        return cont.insert(cont.begin(), std::move(value));
       }
       if (cmp(*(hint - 1), value)) {
         hint = po.increase_capacity(cont, hint);
-        return std::make_pair(cont.insert(hint, value), true);
+        return cont.insert(hint, std::move(value));
       }
-      return sorted.insert(value);
+      return sorted.insert(std::move(value)).first;
     }
 
     if (cmp(*hint, value)) {
       if (hint + 1 == cont.end() || cmp(value, *(hint + 1))) {
         typename OurContainer::iterator it =
           po.increase_capacity(cont, hint + 1);
-        return std::make_pair(cont.insert(it, value), true);
+        return cont.insert(it, std::move(value));
       }
     }
 
     // Value and *hint did not compare, so they are equal keys.
-    return std::make_pair(hint, false);
+    return hint;
   }
 
 }
@@ -214,6 +215,15 @@ public:
     insert(first, last);
   }
 
+  explicit sorted_vector_set(
+      std::initializer_list<value_type> list,
+      const Compare& comp = Compare(),
+      const Allocator& alloc = Allocator())
+    : m_(comp, alloc)
+  {
+    insert(list.begin(), list.end());
+  }
+
   key_compare key_comp() const { return m_; }
   value_compare value_comp() const { return m_; }
 
@@ -231,19 +241,28 @@ public:
   size_type max_size() const    { return m_.cont_.max_size(); }
   bool empty() const            { return m_.cont_.empty();    }
   void reserve(size_type s)     { return m_.cont_.reserve(s); }
+  void shrink_to_fit()          { m_.cont_.shrink_to_fit();   }
   size_type capacity() const    { return m_.cont_.capacity(); }
 
   std::pair<iterator,bool> insert(const value_type& value) {
+    return insert(value_type(value));
+  }
+
+  std::pair<iterator,bool> insert(value_type&& value) {
     iterator it = lower_bound(value);
     if (it == end() || value_comp()(value, *it)) {
       it = get_growth_policy().increase_capacity(m_.cont_, it);
-      return std::make_pair(m_.cont_.insert(it, value), true);
+      return std::make_pair(m_.cont_.insert(it, std::move(value)), true);
     }
     return std::make_pair(it, false);
   }
 
-  std::pair<iterator,bool> insert(iterator hint, const value_type& value) {
-    return detail::insert_with_hint(*this, m_.cont_, hint, value,
+  iterator insert(iterator hint, const value_type& value) {
+    return insert(hint, value_type(value));
+  }
+
+  iterator insert(iterator hint, value_type&& value) {
+    return detail::insert_with_hint(*this, m_.cont_, hint, std::move(value),
       get_growth_policy());
   }
 
@@ -440,6 +459,15 @@ public:
     insert(first, last);
   }
 
+  explicit sorted_vector_map(
+      std::initializer_list<value_type> list,
+      const Compare& comp = Compare(),
+      const Allocator& alloc = Allocator())
+    : m_(value_compare(comp), alloc)
+  {
+    insert(list.begin(), list.end());
+  }
+
   key_compare key_comp() const { return m_; }
   value_compare value_comp() const { return m_; }
 
@@ -457,19 +485,28 @@ public:
   size_type max_size() const    { return m_.cont_.max_size(); }
   bool empty() const            { return m_.cont_.empty();    }
   void reserve(size_type s)     { return m_.cont_.reserve(s); }
+  void shrink_to_fit()          { m_.cont_.shrink_to_fit();   }
   size_type capacity() const    { return m_.cont_.capacity(); }
 
   std::pair<iterator,bool> insert(const value_type& value) {
+    return insert(value_type(value));
+  }
+
+  std::pair<iterator,bool> insert(value_type&& value) {
     iterator it = lower_bound(value.first);
     if (it == end() || value_comp()(value, *it)) {
       it = get_growth_policy().increase_capacity(m_.cont_, it);
-      return std::make_pair(m_.cont_.insert(it, value), true);
+      return std::make_pair(m_.cont_.insert(it, std::move(value)), true);
     }
     return std::make_pair(it, false);
   }
 
-  std::pair<iterator,bool> insert(iterator hint, const value_type& value) {
-    return detail::insert_with_hint(*this, m_.cont_, hint, value,
+  iterator insert(iterator hint, const value_type& value) {
+    return insert(hint, value_type(value));
+  }
+
+  iterator insert(iterator hint, value_type&& value) {
+    return detail::insert_with_hint(*this, m_.cont_, hint, std::move(value),
       get_growth_policy());
   }
 
@@ -515,7 +552,23 @@ public:
     return end();
   }
 
-  size_type count(const key_type& key) {
+  mapped_type& at(const key_type& key) {
+    iterator it = find(key);
+    if (it != end()) {
+      return it->second;
+    }
+    throw std::out_of_range("sorted_vector_map::at");
+  }
+
+  const mapped_type& at(const key_type& key) const {
+    const_iterator it = find(key);
+    if (it != end()) {
+      return it->second;
+    }
+    throw std::out_of_range("sorted_vector_map::at");
+  }
+
+  size_type count(const key_type& key) const {
     return find(key) == end() ? 0 : 1;
   }
 
@@ -566,7 +619,7 @@ public:
   mapped_type& operator[](const key_type& key) {
     iterator it = lower_bound(key);
     if (it == end() || key_comp()(key, it->first)) {
-      return insert(it, value_type(key, mapped_type())).first->second;
+      return insert(it, value_type(key, mapped_type()))->second;
     }
     return it->second;
   }
@@ -603,4 +656,3 @@ inline void swap(sorted_vector_map<K,V,C,A,G>& a,
 }
 
 #endif
-

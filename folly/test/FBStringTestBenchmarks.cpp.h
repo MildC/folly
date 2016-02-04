@@ -1,5 +1,5 @@
 /*
- * Copyright 2012 Facebook, Inc.
+ * Copyright 2015 Facebook, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,14 @@
 /**
  * This file is supposed to be included from within
  * FBStringTest. Do not use otherwise.
+ *
+ * override-include-guard
  */
 
-void BENCHFUN(initRNG)(int iters, int) {
-  srand(seed);
-}
+void BENCHFUN(initRNG)(size_t /* iters */, size_t) { srand(seed); }
 BENCHMARK_PARAM(BENCHFUN(initRNG), 0);
 
-void BENCHFUN(defaultCtor)(int iters, int) {
+void BENCHFUN(defaultCtor)(size_t iters, size_t) {
   FOR_EACH_RANGE (i, 0, iters) {
     STRING s[4096];
     doNotOptimizeAway(&s);
@@ -32,7 +32,7 @@ void BENCHFUN(defaultCtor)(int iters, int) {
 }
 BENCHMARK_PARAM(BENCHFUN(defaultCtor), 0);
 
-void BENCHFUN(copyCtor)(int iters, int arg) {
+void BENCHFUN(copyCtor)(size_t iters, size_t arg) {
   STRING s;
   BENCHMARK_SUSPEND {
     randomString(&s, arg);
@@ -44,7 +44,7 @@ void BENCHFUN(copyCtor)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(copyCtor), 32768);
 
-void BENCHFUN(ctorFromArray)(int iters, int arg) {
+void BENCHFUN(ctorFromArray)(size_t iters, size_t arg) {
   STRING s;
   BENCHMARK_SUSPEND {
     randomString(&s, arg);
@@ -59,7 +59,7 @@ void BENCHFUN(ctorFromArray)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(ctorFromArray), 32768);
 
-void BENCHFUN(ctorFromTwoPointers)(int iters, int arg) {
+void BENCHFUN(ctorFromTwoPointers)(size_t iters, size_t arg) {
   static STRING s;
   BENCHMARK_SUSPEND {
     if (s.size() < arg) s.resize(arg);
@@ -75,7 +75,7 @@ BENCHMARK_PARAM(BENCHFUN(ctorFromTwoPointers), 15);
 BENCHMARK_PARAM(BENCHFUN(ctorFromTwoPointers), 23);
 BENCHMARK_PARAM(BENCHFUN(ctorFromTwoPointers), 24);
 
-void BENCHFUN(ctorFromChar)(int iters, int arg) {
+void BENCHFUN(ctorFromChar)(size_t iters, size_t arg) {
   FOR_EACH_RANGE (i, 0, iters) {
     STRING s1('a', arg);
     doNotOptimizeAway(&s1);
@@ -83,7 +83,7 @@ void BENCHFUN(ctorFromChar)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(ctorFromChar), 1048576);
 
-void BENCHFUN(assignmentOp)(int iters, int arg) {
+void BENCHFUN(assignmentOp)(size_t iters, size_t arg) {
   STRING s;
   BENCHMARK_SUSPEND {
     randomString(&s, arg);
@@ -99,7 +99,7 @@ void BENCHFUN(assignmentOp)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(assignmentOp), 256);
 
-void BENCHFUN(assignmentFill)(int iters, int) {
+void BENCHFUN(assignmentFill)(size_t iters, size_t) {
   STRING s;
   FOR_EACH_RANGE (i, 0, iters) {
     s = static_cast<char>(i);
@@ -108,7 +108,7 @@ void BENCHFUN(assignmentFill)(int iters, int) {
 }
 BENCHMARK_PARAM(BENCHFUN(assignmentFill), 0);
 
-void BENCHFUN(resize)(int iters, int arg) {
+void BENCHFUN(resize)(size_t iters, size_t arg) {
   STRING s;
   FOR_EACH_RANGE (i, 0, iters) {
     s.resize(random(0, arg));
@@ -117,7 +117,7 @@ void BENCHFUN(resize)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(resize), 524288);
 
-void BENCHFUN(findSuccessful)(int iters, int arg) {
+void BENCHFUN(findSuccessful)(size_t iters, size_t /* arg */) {
   size_t pos, len;
   STRING s;
 
@@ -156,7 +156,7 @@ expect to get a call for an interview.";
 }
 BENCHMARK_PARAM(BENCHFUN(findSuccessful), 524288);
 
-void BENCHFUN(findUnsuccessful)(int iters, int arg) {
+void BENCHFUN(findUnsuccessful)(size_t iters, size_t /* arg */) {
   STRING s, s1;
 
   BENCHMARK_SUSPEND {
@@ -190,7 +190,24 @@ expect to get a call for an interview.";
 }
 BENCHMARK_PARAM(BENCHFUN(findUnsuccessful), 524288);
 
-void BENCHFUN(replace)(int iters, int arg) {
+void BENCHFUN(equality)(size_t iters, size_t arg) {
+  std::vector<STRING> haystack(arg);
+
+  BENCHMARK_SUSPEND {
+    for (auto& hay : haystack) {
+      randomBinaryString(&hay, 1024);
+    }
+  }
+
+  FOR_EACH_RANGE (i, 0, iters) {
+    STRING needle;
+    randomBinaryString(&needle, 1024);
+    doNotOptimizeAway(std::find(haystack.begin(), haystack.end(), needle));
+  }
+}
+BENCHMARK_PARAM(BENCHFUN(equality), 65536);
+
+void BENCHFUN(replace)(size_t iters, size_t arg) {
   STRING s;
   BENCHMARK_SUSPEND {
     randomString(&s, arg);
@@ -210,7 +227,7 @@ void BENCHFUN(replace)(int iters, int arg) {
 }
 BENCHMARK_PARAM(BENCHFUN(replace), 256);
 
-void BENCHFUN(push_back)(int iters, int arg) {
+void BENCHFUN(push_back)(size_t iters, size_t arg) {
   FOR_EACH_RANGE (i, 0, iters) {
     STRING s;
     FOR_EACH_RANGE (j, 0, arg) {
@@ -222,3 +239,38 @@ BENCHMARK_PARAM(BENCHFUN(push_back), 1);
 BENCHMARK_PARAM(BENCHFUN(push_back), 23);
 BENCHMARK_PARAM(BENCHFUN(push_back), 127);
 BENCHMARK_PARAM(BENCHFUN(push_back), 1024);
+
+void BENCHFUN(short_append)(size_t iters, size_t arg) {
+  FOR_EACH_RANGE (i, 0, iters) {
+    STRING s;
+    FOR_EACH_RANGE (j, 0, arg) {
+      s += "012";
+    }
+  }
+}
+BENCHMARK_PARAM(BENCHFUN(short_append), 23);
+BENCHMARK_PARAM(BENCHFUN(short_append), 1024);
+
+void BENCHFUN(getline)(size_t iters, size_t arg) {
+  string lines;
+
+  BENCHMARK_SUSPEND {
+    string line;
+    FOR_EACH_RANGE(i, 0, 512) {
+      randomString(&line, arg);
+      lines += line;
+      lines += '\n';
+    }
+  }
+
+  STRING line;
+  while (iters) {
+    std::istringstream is(lines);
+    while (iters && getline(is, line)) {
+      folly::doNotOptimizeAway(line.size());
+      iters--;
+    }
+  }
+}
+BENCHMARK_PARAM(BENCHFUN(getline), 23);
+BENCHMARK_PARAM(BENCHFUN(getline), 1000);
